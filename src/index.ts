@@ -72,7 +72,8 @@ async function main(): Promise<void> {
   connection.on('connected', (_sessionId: string, _userId: string) => {
     const currentTools = mcpHost.getAllTools();
     if (currentTools.length > 0) {
-      connection.sendToolManifest(currentTools);
+      const warnings = mcpHost.getDuplicateWarnings();
+      connection.sendToolManifest(currentTools, warnings.length > 0 ? warnings : undefined);
     } else {
       console.log('[Delegate] No tools to advertise');
     }

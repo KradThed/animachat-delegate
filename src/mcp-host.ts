@@ -3,6 +3,8 @@
  *
  * Spawns and manages MCP server subprocesses via stdio transport.
  * Collects tool definitions from all servers and routes tool calls.
+ *
+ * Phase 3: Deterministic duplicate detection (sorted server order, first-wins).
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -20,6 +22,12 @@ interface McpServer {
   tools: ToolDefinition[];
 }
 
+export interface DuplicateToolWarning {
+  toolName: string;
+  fromServer: string;
+  conflictsWith: string;
+}
+
 // =============================================================================
 // McpHostManager
 // =============================================================================
@@ -27,6 +35,7 @@ interface McpServer {
 export class McpHostManager {
   private servers: Map<string, McpServer> = new Map();
   private toolToServer: Map<string, string> = new Map();
+  private _duplicateWarnings: DuplicateToolWarning[] = [];
 
   /**
    * Spawn all configured MCP servers and collect their tools.
@@ -52,11 +61,18 @@ export class McpHostManager {
       }
     }
 
+    // Rebuild tool list in deterministic sorted order after all servers are up
+    this.rebuildToolList();
+
     const started = [...this.servers.values()];
     const totalTools = started.reduce((sum, s) => sum + s.tools.length, 0);
     console.log(
       `[McpHost] ${started.length}/${configs.length} servers started, ${totalTools} tools available`
     );
+
+    if (this._duplicateWarnings.length > 0) {
+      console.warn(`[McpHost] ${this._duplicateWarnings.length} duplicate tool(s) detected (first-wins, duplicates skipped)`);
+    }
   }
 
   /**
@@ -67,7 +83,7 @@ export class McpHostManager {
 
     console.log(`[McpHost] Stopping ${this.servers.size} MCP server(s)...`);
 
-    const results = await Promise.allSettled(
+    await Promise.allSettled(
       [...this.servers.values()].map(async (server) => {
         try {
           await server.client.close();
@@ -80,6 +96,7 @@ export class McpHostManager {
 
     this.servers.clear();
     this.toolToServer.clear();
+    this._duplicateWarnings = [];
   }
 
   /**
@@ -91,6 +108,13 @@ export class McpHostManager {
       tools.push(...server.tools);
     }
     return tools;
+  }
+
+  /**
+   * Get duplicate warnings from the last tool collection.
+   */
+  getDuplicateWarnings(): DuplicateToolWarning[] {
+    return this._duplicateWarnings;
   }
 
   /**
@@ -138,6 +162,36 @@ export class McpHostManager {
     }
   }
 
+  /**
+   * Rebuild the tool-to-server mapping in deterministic sorted order.
+   * First-wins on duplicates. Populates _duplicateWarnings.
+   */
+  rebuildToolList(): void {
+    this.toolToServer.clear();
+    this._duplicateWarnings = [];
+
+    // Sort servers by name for deterministic order
+    const sorted = [...this.servers.values()].sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const server of sorted) {
+      for (const tool of server.tools) {
+        if (this.toolToServer.has(tool.name)) {
+          const existing = this.toolToServer.get(tool.name)!;
+          console.error(
+            `[McpHost] DUPLICATE: "${tool.name}" from "${server.name}" conflicts with "${existing}" (skipped)`
+          );
+          this._duplicateWarnings.push({
+            toolName: tool.name,
+            fromServer: server.name,
+            conflictsWith: existing,
+          });
+          continue; // SKIP duplicate (first-wins, deterministic)
+        }
+        this.toolToServer.set(tool.name, server.name);
+      }
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Private
   // --------------------------------------------------------------------------
@@ -165,7 +219,7 @@ export class McpHostManager {
       tools: [],
     };
 
-    // Collect tools
+    // Collect tools from this server
     await this.collectTools(server);
 
     this.servers.set(config.name, server);
@@ -184,16 +238,5 @@ export class McpHostManager {
         required: (tool.inputSchema as any)?.required,
       },
     }));
-
-    // Build tool → server mapping
-    for (const tool of server.tools) {
-      if (this.toolToServer.has(tool.name)) {
-        console.warn(
-          `[McpHost] Tool name conflict: "${tool.name}" from "${server.name}" ` +
-          `shadows existing tool from "${this.toolToServer.get(tool.name)}"`
-        );
-      }
-      this.toolToServer.set(tool.name, server.name);
-    }
   }
 }

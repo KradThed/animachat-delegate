@@ -105,14 +105,22 @@ export class DelegateConnection extends EventEmitter {
 
   /**
    * Send tool manifest to advertise available tools.
+   * Optionally includes duplicate warnings from MCP server tool collection.
    */
-  sendToolManifest(tools: Array<{ name: string; description: string; inputSchema: unknown }>): void {
+  sendToolManifest(
+    tools: Array<{ name: string; description: string; inputSchema: unknown }>,
+    warnings?: Array<{ toolName: string; fromServer: string; conflictsWith: string }>
+  ): void {
     this.send({
       type: 'tool_manifest',
       delegateId: this.options.delegateId,
       tools,
+      ...(warnings?.length ? { warnings } : {}),
     });
     console.log(`[Connection] Sent tool manifest: ${tools.length} tools (${tools.map(t => t.name).join(', ')})`);
+    if (warnings?.length) {
+      console.warn(`[Connection] Included ${warnings.length} duplicate warning(s) in manifest`);
+    }
   }
 
   /**
