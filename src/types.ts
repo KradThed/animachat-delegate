@@ -17,6 +17,7 @@ export const ToolDefinitionSchema = z.object({
     properties: z.record(z.unknown()),
     required: z.array(z.string()).optional(),
   }),
+  serverName: z.string().optional(),
 });
 
 export type ToolDefinition = z.infer<typeof ToolDefinitionSchema>;

@@ -5,10 +5,12 @@
  * Collects tool definitions from all servers and routes tool calls.
  *
  * Phase 3: Deterministic duplicate detection (sorted server order, first-wins).
+ * Phase 7: Virtual _scope_elevate tool for capability elevation requests.
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { McpServerConfig, ToolDefinition } from './types.js';
 
 // =============================================================================
@@ -18,7 +20,7 @@ import type { McpServerConfig, ToolDefinition } from './types.js';
 interface McpServer {
   name: string;
   client: Client;
-  transport: StdioClientTransport;
+  transport: StdioClientTransport | SSEClientTransport;
   tools: ToolDefinition[];
 }
 
@@ -29,6 +31,26 @@ export interface DuplicateToolWarning {
 }
 
 // =============================================================================
+// Virtual Tools
+// =============================================================================
+
+/** Virtual tool injected into tool list so MCP servers can request capability elevation */
+const SCOPE_ELEVATE_TOOL: ToolDefinition = {
+  name: '_scope_elevate',
+  description: 'Request capability elevation from the user. Returns { approved: boolean, newCapabilities?: string[] }.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      featureSet: { type: 'string', description: 'Feature set label to elevate' },
+      label: { type: 'string', description: 'Human-readable label for the request' },
+      reason: { type: 'string', description: 'Why elevation is needed' },
+      capabilities: { type: 'array', items: { type: 'string' }, description: 'Capabilities to request' },
+    },
+    required: ['featureSet', 'label', 'reason', 'capabilities'],
+  },
+};
+
+// =============================================================================
 // McpHostManager
 // =============================================================================
 
@@ -36,6 +58,15 @@ export class McpHostManager {
   private servers: Map<string, McpServer> = new Map();
   private toolToServer: Map<string, string> = new Map();
   private _duplicateWarnings: DuplicateToolWarning[] = [];
+  private scopeElevateHandler?: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>;
+
+  /**
+   * Set the handler for _scope_elevate virtual tool calls.
+   * Called from index.ts after connection is established.
+   */
+  setScopeElevateHandler(handler: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>): void {
+    this.scopeElevateHandler = handler;
+  }
 
   /**
    * Spawn all configured MCP servers and collect their tools.
@@ -111,6 +142,30 @@ export class McpHostManager {
   }
 
   /**
+   * Get all tools with serverName attached to each tool.
+   * Used for tool manifests so the server can track tool origin.
+   * Includes virtual _scope_elevate tool if handler is set.
+   */
+  getAllToolsWithServer(): ToolDefinition[] {
+    const tools: ToolDefinition[] = [];
+    // Use toolToServer map (populated by rebuildToolList in deterministic order)
+    // Only includes non-duplicate tools
+    for (const [toolName, serverName] of this.toolToServer) {
+      const server = this.servers.get(serverName);
+      if (!server) continue;
+      const tool = server.tools.find(t => t.name === toolName);
+      if (tool) {
+        tools.push({ ...tool, serverName });
+      }
+    }
+    // Append virtual _scope_elevate tool (no serverName — it's delegate-internal)
+    if (this.scopeElevateHandler) {
+      tools.push(SCOPE_ELEVATE_TOOL);
+    }
+    return tools;
+  }
+
+  /**
    * Get duplicate warnings from the last tool collection.
    */
   getDuplicateWarnings(): DuplicateToolWarning[] {
@@ -119,11 +174,23 @@ export class McpHostManager {
 
   /**
    * Call a tool by name, routing to the correct MCP server.
+   * Intercepts virtual _scope_elevate tool before MCP server routing.
    */
   async callTool(
     name: string,
     args: Record<string, unknown>
   ): Promise<{ content: string; isError: boolean }> {
+    // Intercept virtual _scope_elevate tool
+    if (name === '_scope_elevate' && this.scopeElevateHandler) {
+      try {
+        const result = await this.scopeElevateHandler(args);
+        return { content: JSON.stringify(result), isError: false };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: `Scope elevate failed: ${msg}`, isError: true };
+      }
+    }
+
     const serverName = this.toolToServer.get(name);
     if (!serverName) {
       return { content: `Unknown tool: ${name}`, isError: true };
@@ -190,6 +257,40 @@ export class McpHostManager {
         this.toolToServer.set(tool.name, server.name);
       }
     }
+  }
+
+  /**
+   * Dynamically add a new MCP server by URL (SSE transport).
+   * Used for scope change — when a delegate requests a new server connection.
+   */
+  async addServer(url: string, serverName?: string): Promise<{ tools: ToolDefinition[] }> {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      throw new Error(`Invalid URL: ${url}`);
+    }
+
+    const name = serverName ?? parsedUrl.hostname;
+    if (this.servers.has(name)) {
+      throw new Error(`Server "${name}" already exists`);
+    }
+
+    const client = new Client(
+      { name: `animachat-delegate:${name}`, version: '1.0.0' },
+      { capabilities: {} }
+    );
+
+    const transport = new SSEClientTransport(parsedUrl);
+    await client.connect(transport);
+
+    const server: McpServer = { name, client, transport, tools: [] };
+    await this.collectTools(server);
+    this.servers.set(name, server);
+    this.rebuildToolList();
+
+    console.log(`[McpHost] Dynamic server "${name}" added via SSE (${server.tools.length} tools)`);
+    return { tools: server.tools };
   }
 
   // --------------------------------------------------------------------------

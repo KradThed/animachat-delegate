@@ -99,25 +99,46 @@ export class WebhookServer {
 
       // Parse payload
       const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+      const headers = req.headers as Record<string, string>;
       const parsed = this.parsePayload(
         endpoint.source,
         body,
-        req.headers as Record<string, string>
+        headers
       );
 
-      // Send trigger
-      const triggerId = randomUUID();
-      this.connection.sendTriggerInference({
-        triggerId,
-        source: `${endpoint.source}_webhook`,
-        conversationId: endpoint.conversation_id,
-        participantId: endpoint.participant_id,
-        context: parsed.context,
-        systemMessage: parsed.systemMessage,
-      });
+      const eventId = randomUUID();
 
-      console.log(`[Webhooks] Forwarded ${endpoint.source} event as trigger ${triggerId}`);
-      res.json({ accepted: true, triggerId });
+      if (this.connection.isMcpl && endpoint.conversation_id) {
+        // MCPL mode: use push events with idempotency
+        const deliveryId = this.extractDeliveryId(endpoint.source, headers);
+        const eventType = this.extractEventType(endpoint.source, headers);
+
+        this.connection.sendPushEvent({
+          id: eventId,
+          source: `${endpoint.source}_webhook`,
+          conversationId: endpoint.conversation_id,
+          eventType,
+          payload: parsed.context,
+          systemMessage: parsed.systemMessage,
+          idempotencyKey: deliveryId || eventId,
+        });
+
+        console.log(`[Webhooks] Forwarded ${endpoint.source} event as MCPL push ${eventId} (idempotencyKey: ${deliveryId || 'auto'})`);
+        res.json({ accepted: true, eventId, mode: 'mcpl' });
+      } else {
+        // Legacy mode: use trigger_inference
+        this.connection.sendTriggerInference({
+          triggerId: eventId,
+          source: `${endpoint.source}_webhook`,
+          conversationId: endpoint.conversation_id,
+          participantId: endpoint.participant_id,
+          context: parsed.context,
+          systemMessage: parsed.systemMessage,
+        });
+
+        console.log(`[Webhooks] Forwarded ${endpoint.source} event as trigger ${eventId}`);
+        res.json({ accepted: true, triggerId: eventId, mode: 'legacy' });
+      }
     });
   }
 
@@ -271,6 +292,35 @@ export class WebhookServer {
         `External event received from ${source}. ` +
         `Analyze the payload and respond appropriately.`,
     };
+  }
+
+  /**
+   * Extract delivery ID from webhook headers for idempotency.
+   * Primary key to prevent duplicate processing on webhook retries.
+   */
+  private extractDeliveryId(source: string, headers: Record<string, string>): string | undefined {
+    switch (source) {
+      case 'github':
+        return headers['x-github-delivery'];
+      case 'gitlab':
+        return headers['x-gitlab-event-uuid'];
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * Extract event type from webhook headers.
+   */
+  private extractEventType(source: string, headers: Record<string, string>): string {
+    switch (source) {
+      case 'github':
+        return headers['x-github-event'] || 'unknown';
+      case 'gitlab':
+        return headers['x-gitlab-event'] || 'unknown';
+      default:
+        return 'webhook';
+    }
   }
 
   private verifySignature(
