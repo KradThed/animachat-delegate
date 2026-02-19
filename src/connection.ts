@@ -596,6 +596,16 @@ export class DelegateConnection extends EventEmitter {
         this.emit('mcpl_checkpoint_list_response', msg);
         break;
 
+      case 'mcpl/error':
+        // Fix #4: server-side error (access denied, rate limited, etc.)
+        console.warn(
+          `[Connection] MCPL error: code=${msg.code}, message="${msg.message}"` +
+          (msg.retryAfterMs ? `, retryAfter=${msg.retryAfterMs}ms` : '') +
+          (msg.inReplyTo?.type ? `, inReplyTo=${msg.inReplyTo.type}` : '')
+        );
+        this.emit('mcpl_error', msg);
+        break;
+
       default:
         console.log(`[Connection] Unhandled MCPL message: ${msg.type}`);
     }
@@ -647,6 +657,8 @@ export class DelegateConnection extends EventEmitter {
     userMessage: string;
     maxTokens?: number;
     stream?: boolean;
+    parentChainId?: string;   // Fix #5: chain tracking for recursion prevention
+    parentFrameId?: string;   // Fix #5: frame tracking for recursion prevention
   }): void {
     this.send({
       type: 'mcpl/inference_request',

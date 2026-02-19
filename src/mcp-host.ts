@@ -61,6 +61,14 @@ export class McpHostManager {
   private scopeElevateHandler?: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>;
 
   /**
+   * Get the tool name → server name mapping (read-only).
+   * Used by TelemetryBus to resolve server names for tool calls.
+   */
+  getToolServerMap(): ReadonlyMap<string, string> {
+    return this.toolToServer;
+  }
+
+  /**
    * Set the handler for _scope_elevate virtual tool calls.
    * Called from index.ts after connection is established.
    */

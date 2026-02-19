@@ -45,6 +45,10 @@ export const ToolCallRequestSchema = z.object({
     input: z.record(z.unknown()),
   }),
   timeout: z.number().default(30000),
+  inferenceContext: z.object({            // Fix #5: chain/frame tracking for recursion prevention
+    chainId: z.string(),
+    frameId: z.string(),
+  }).optional(),
 });
 
 export const TriggerInferenceResultSchema = z.object({
@@ -87,10 +91,14 @@ export type ServerMessage = z.infer<typeof ServerMessageSchema>;
 // =============================================================================
 
 export const McpServerConfigSchema = z.object({
-  name: z.string(),
+  // M5: validated server name — lowercase alphanum, dash, underscore, max 63 chars
+  name: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,62}$/, 'Server name: lowercase alphanum, dash, underscore'),
   command: z.string(),
   args: z.array(z.string()).default([]),
   env: z.record(z.string()).optional(),
+  id: z.string().optional(),             // Fix #3: persistent server ID (auto-generated if missing)
+  // Opt-in per server (not per tool) — all tools from this server may receive _mcpl in input
+  acceptsMcplContext: z.boolean().default(false),
 });
 
 export const WebhookEndpointSchema = z.object({

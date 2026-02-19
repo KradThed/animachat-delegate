@@ -139,6 +139,8 @@ export interface McplInferenceRequest {
   userMessage: string;
   maxTokens?: number;
   stream?: boolean;            // Phase 7 Batch 5: request streaming response
+  parentChainId?: string;      // Fix #5: chain tracking for recursion prevention
+  parentFrameId?: string;      // Fix #5: frame tracking for recursion prevention
 }
 
 export interface McplInferenceResponse {
