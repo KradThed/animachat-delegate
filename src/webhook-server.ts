@@ -29,11 +29,19 @@ export class WebhookServer {
   private httpServer: ReturnType<typeof this.app.listen> | null = null;
   private connection: DelegateConnection;
 
+  // DEL-5: Per-endpoint rate limiting
+  private rateLimits = new Map<string, number[]>();
+  private static readonly RATE_WINDOW_MS = 60_000;
+  private static readonly RATE_MAX = 60;
+
   constructor(connection: DelegateConnection) {
     this.connection = connection;
     this.app = express();
-    this.app.use(express.json({ limit: '1mb' }));
-    this.app.use(express.text({ type: 'text/*', limit: '1mb' }));
+    // DEL-6: Capture raw body for HMAC signature verification
+    this.app.use(express.json({
+      limit: '1mb',
+      verify: (req: any, _res: any, buf: Buffer) => { req.rawBody = buf; },
+    }));
   }
 
   /**
@@ -75,12 +83,20 @@ export class WebhookServer {
 
   private registerEndpoint(endpoint: WebhookEndpoint): void {
     this.app.post(endpoint.path, (req, res) => {
-      // Signature verification
+      // DEL-5: Rate limiting
+      const rateKey = `${req.ip}:${endpoint.path}`;
+      if (!this.checkRateLimit(rateKey)) {
+        res.status(429).json({ error: 'Rate limit exceeded' });
+        return;
+      }
+
+      // Signature verification — DEL-6: use raw body for HMAC
       if (endpoint.secret) {
+        const rawBody: Buffer | undefined = (req as any).rawBody;
         const valid = this.verifySignature(
           endpoint.source,
           endpoint.secret,
-          typeof req.body === 'string' ? req.body : JSON.stringify(req.body),
+          rawBody || Buffer.from(JSON.stringify(req.body)),
           req.headers as Record<string, string>
         );
         if (!valid) {
@@ -97,8 +113,14 @@ export class WebhookServer {
         return;
       }
 
-      // Parse payload
-      const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+      // Parse payload — DEL-7: safe JSON.parse
+      let body: Record<string, unknown>;
+      try {
+        body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+      } catch {
+        res.status(400).json({ error: 'Invalid JSON payload' });
+        return;
+      }
       const headers = req.headers as Record<string, string>;
       const parsed = this.parsePayload(
         endpoint.source,
@@ -323,22 +345,36 @@ export class WebhookServer {
     }
   }
 
+  // DEL-5: Sliding window rate limiter
+  private checkRateLimit(key: string): boolean {
+    const now = Date.now();
+    const timestamps = this.rateLimits.get(key) || [];
+    const recent = timestamps.filter(t => now - t < WebhookServer.RATE_WINDOW_MS);
+    if (recent.length >= WebhookServer.RATE_MAX) return false;
+    recent.push(now);
+    this.rateLimits.set(key, recent);
+    return true;
+  }
+
   private verifySignature(
     source: string,
     secret: string,
-    body: string,
+    body: Buffer,
     headers: Record<string, string>
   ): boolean {
     try {
       if (source === 'gitlab') {
-        // GitLab uses a simple token comparison via X-Gitlab-Token header
+        // DEL-16: Timing-safe GitLab token comparison
         const token = headers['x-gitlab-token'];
         if (!token) return false;
-        return token === secret;
+        const tokenBuf = Buffer.from(token);
+        const secretBuf = Buffer.from(secret);
+        if (tokenBuf.length !== secretBuf.length) return false;
+        return timingSafeEqual(tokenBuf, secretBuf);
       }
 
       if (source === 'github') {
-        // GitHub uses HMAC-SHA256 via X-Hub-Signature-256 header
+        // DEL-6: GitHub HMAC-SHA256 against raw body bytes
         const signature = headers['x-hub-signature-256'];
         if (!signature) return false;
 

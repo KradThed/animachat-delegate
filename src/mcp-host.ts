@@ -60,6 +60,9 @@ export class McpHostManager {
   private _duplicateWarnings: DuplicateToolWarning[] = [];
   private scopeElevateHandler?: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>;
 
+  /** DEL-12: Callback when an MCP server process dies unexpectedly */
+  onServerDied?: (serverName: string) => void;
+
   /**
    * Get the tool name → server name mapping (read-only).
    * Used by TelemetryBus to resolve server names for tool calls.
@@ -292,6 +295,19 @@ export class McpHostManager {
     const transport = new SSEClientTransport(parsedUrl);
     await client.connect(transport);
 
+    // DEL-14: Detect SSE server connection loss (must be after connect())
+    client.onclose = () => {
+      if (this.servers.has(name)) {
+        console.error(`[McpHost] Dynamic server "${name}" disconnected`);
+        this.servers.delete(name);
+        this.rebuildToolList();
+        this.onServerDied?.(name);
+      }
+    };
+    client.onerror = (error) => {
+      console.error(`[McpHost] Dynamic server "${name}" error: ${error.message}`);
+    };
+
     const server: McpServer = { name, client, transport, tools: [] };
     await this.collectTools(server);
     this.servers.set(name, server);
@@ -321,6 +337,20 @@ export class McpHostManager {
 
     await client.connect(transport);
 
+    // DEL-12: Detect MCP server crash/exit (must be set AFTER connect() which replaces callbacks)
+    const serverName = config.name;
+    client.onclose = () => {
+      if (this.servers.has(serverName)) {
+        console.error(`[McpHost] Server "${serverName}" process exited unexpectedly`);
+        this.servers.delete(serverName);
+        this.rebuildToolList();
+        this.onServerDied?.(serverName);
+      }
+    };
+    client.onerror = (error) => {
+      console.error(`[McpHost] Server "${serverName}" error: ${error.message}`);
+    };
+
     const server: McpServer = {
       name: config.name,
       client,
@@ -336,16 +366,24 @@ export class McpHostManager {
   }
 
   private async collectTools(server: McpServer): Promise<void> {
-    const result = await server.client.listTools();
-
-    server.tools = result.tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description || '',
-      inputSchema: {
-        type: 'object' as const,
-        properties: (tool.inputSchema as any)?.properties ?? {},
-        required: (tool.inputSchema as any)?.required,
-      },
-    }));
+    // DEL-13: Handle cursor-based pagination for large tool sets
+    const allTools: ToolDefinition[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await server.client.listTools(cursor ? { cursor } : undefined);
+      for (const tool of result.tools) {
+        allTools.push({
+          name: tool.name,
+          description: tool.description || '',
+          inputSchema: {
+            type: 'object' as const,
+            properties: (tool.inputSchema as any)?.properties ?? {},
+            required: (tool.inputSchema as any)?.required,
+          },
+        });
+      }
+      cursor = result.nextCursor;
+    } while (cursor);
+    server.tools = allTools;
   }
 }

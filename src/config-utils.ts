@@ -52,7 +52,7 @@ export function writeConfigRaw(configPath: string, config: any): void {
 const LOCK_STALE_MS = 30_000;
 const LOCK_MAX_RETRIES = 3;
 
-function withLock<T>(configPath: string, fn: () => T): T {
+export function withLock<T>(configPath: string, fn: () => T): T {
   const lockPath = configPath + '.lock';
 
   for (let attempt = 0; attempt < LOCK_MAX_RETRIES; attempt++) {
@@ -171,16 +171,27 @@ export function ensureServerIds(configPath: string | undefined, delegateId: stri
 
   if (!data.mcp_servers || !Array.isArray(data.mcp_servers)) return;
 
-  let modified = false;
-  for (const server of data.mcp_servers) {
-    if (!server.id) {
-      server.id = deterministicServerId(delegateId, server.name, server.command);
-      modified = true;
-    }
-  }
+  // Quick check: if all servers already have IDs, skip lock entirely
+  const needsWrite = data.mcp_servers.some((s: any) => !s.id);
+  if (!needsWrite) return;
 
-  if (modified) {
-    writeConfigRaw(resolvedPath, data);
-    console.log(`[Config] Generated persistent server IDs for ${data.mcp_servers.filter((s: any) => s.id).length} server(s)`);
-  }
+  // DEL-10: Use lock for read-modify-write to prevent TOCTOU with concurrent writers
+  withLock(resolvedPath, () => {
+    // Re-read inside lock to get latest state
+    const fresh = readConfigRaw(configPath);
+    if (!fresh.data.mcp_servers || !Array.isArray(fresh.data.mcp_servers)) return;
+
+    let modified = false;
+    for (const server of fresh.data.mcp_servers) {
+      if (!server.id) {
+        server.id = deterministicServerId(delegateId, server.name, server.command);
+        modified = true;
+      }
+    }
+
+    if (modified) {
+      writeConfigRaw(fresh.path, fresh.data);
+      console.log(`[Config] Generated persistent server IDs for ${fresh.data.mcp_servers.filter((s: any) => s.id).length} server(s)`);
+    }
+  });
 }

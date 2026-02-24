@@ -71,14 +71,24 @@ export class DelegateConnection extends EventEmitter {
   private rcOutSeq = 0;
   private rcInSeq = 0;
   private rcLastAckedSeq = 0;
-  private rcBuffer = new Map<number, Record<string, unknown>>();
+  private rcBuffer = new Map<number, { frame: Record<string, unknown>; ts: number }>();
   private rcPending = new Map<number, Record<string, unknown>>();
   private rcBareAckTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly RC_MAX_UNACKED = 64;
   private static readonly RC_BARE_ACK_DELAY = 50;
+  private static readonly RC_MAX_BUFFER_AGE = 120_000; // DEL-1: 2 min max age for buffered frames
+
+  // DEL-4: WS-level ping dead connection detection
+  private pongReceived = true;
 
   get isMcpl(): boolean { return this._isMcpl; }
   get featureSets(): Record<string, McplFeatureSet> { return this._featureSets; }
+
+  /** DEL-2: Redact auth tokens from URLs for safe logging */
+  private static redactUrl(url: string): string {
+    return url
+      .replace(/([?&])(apiKey|token)=[^&]*/gi, '$1$2=[REDACTED]');
+  }
 
   constructor(options: ConnectionOptions) {
     super();
@@ -146,7 +156,7 @@ export class DelegateConnection extends EventEmitter {
       }
       const seq = ++this.rcOutSeq;
       const frame = { seq, ack: this.rcInSeq, payload: message };
-      this.rcBuffer.set(seq, frame);
+      this.rcBuffer.set(seq, { frame, ts: Date.now() });
       this.ws.send(JSON.stringify(frame));
       // Cancel pending bare ack (piggybacked ack on this frame)
       if (this.rcBareAckTimer) {
@@ -220,6 +230,7 @@ export class DelegateConnection extends EventEmitter {
   private async doConnect(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.setState('connecting');
+      this.pongReceived = true; // DEL-4: reset for new connection
 
       const { serverUrl, token, delegateId } = this.options;
       const separator = serverUrl.includes('?') ? '&' : '?';
@@ -232,7 +243,7 @@ export class DelegateConnection extends EventEmitter {
         : `token=${encodeURIComponent(token)}`;
       const url = `${serverUrl}${separator}${authParam}&role=delegate&delegateId=${encodeURIComponent(delegateId)}`;
 
-      console.log(`[Connection] Connecting to ${serverUrl} as delegate "${delegateId}"...`);
+      console.log(`[Connection] Connecting to ${DelegateConnection.redactUrl(url)} as delegate "${delegateId}"...`);
 
       try {
         this.ws = new WebSocket(url);
@@ -242,13 +253,21 @@ export class DelegateConnection extends EventEmitter {
         return;
       }
 
+      // DEL-3: Single-settle guard — prevents double resolve/reject race
+      let settled = false;
+      const trySettle = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        clearTimeout(connectionTimeout);
+        return true;
+      };
+
       const connectionTimeout = setTimeout(() => {
-        if (this.state === 'connecting' || this.state === 'authenticating') {
-          console.error('[Connection] Connection timeout');
-          this.ws?.terminate();
-          this.setState('disconnected');
-          reject(new Error('Connection timeout'));
-        }
+        if (!trySettle()) return;
+        console.error('[Connection] Connection timeout');
+        this.ws?.terminate();
+        this.setState('disconnected');
+        reject(new Error('Connection timeout'));
       }, 15000);
 
       this.ws.on('open', () => {
@@ -292,7 +311,7 @@ export class DelegateConnection extends EventEmitter {
                 // Stay in authenticating state, wait for mcpl/ack
               } else {
                 // Legacy flow — no MCPL
-                clearTimeout(connectionTimeout);
+                if (!trySettle()) return; // DEL-3
                 this.reconnectAttempts = 0;
                 this.setState('connected');
                 this.startHeartbeat();
@@ -301,7 +320,7 @@ export class DelegateConnection extends EventEmitter {
                 resolve();
               }
             } else {
-              clearTimeout(connectionTimeout);
+              if (!trySettle()) return; // DEL-3
               const err = new Error(`Authentication failed: ${msg.error || 'unknown'}`);
               this.setState('disconnected');
               this.ws?.close();
@@ -313,7 +332,7 @@ export class DelegateConnection extends EventEmitter {
           // Handle mcpl/ack during authentication phase — may arrive as frame on resume
           if (msg.type === 'mcpl/ack') {
             // Plain mcpl/ack (new session, no framing yet)
-            clearTimeout(connectionTimeout);
+            if (!trySettle()) return; // DEL-3
             this.handleMcplAckAuth(msg, resolve);
             return;
           }
@@ -326,7 +345,7 @@ export class DelegateConnection extends EventEmitter {
             }
             this.rcInSeq = msg.seq;
 
-            clearTimeout(connectionTimeout);
+            if (!trySettle()) return; // DEL-3
             const ackMsg = msg.payload;
             // If resumedFromSeq present — resend buffered frames
             if (typeof ackMsg.resumedFromSeq === 'number') {
@@ -348,7 +367,6 @@ export class DelegateConnection extends EventEmitter {
       });
 
       this.ws.on('close', (code, reason) => {
-        clearTimeout(connectionTimeout);
         this.stopHeartbeat();
 
         // Cancel pending bare ack timer
@@ -360,8 +378,10 @@ export class DelegateConnection extends EventEmitter {
         const reasonStr = reason.toString() || 'unknown';
 
         if (this.state === 'connecting' || this.state === 'authenticating') {
-          this.setState('disconnected');
-          reject(new Error(`Connection closed during setup: ${code} ${reasonStr}`));
+          if (trySettle()) { // DEL-3
+            this.setState('disconnected');
+            reject(new Error(`Connection closed during setup: ${code} ${reasonStr}`));
+          }
           return;
         }
 
@@ -388,7 +408,7 @@ export class DelegateConnection extends EventEmitter {
       });
 
       this.ws.on('pong', () => {
-        // WebSocket-level pong (from ws ping)
+        this.pongReceived = true; // DEL-4: WS-level pong received
       });
     });
   }
@@ -424,7 +444,7 @@ export class DelegateConnection extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private handleReliableFrame(frame: { seq: number; ack: number; payload?: Record<string, unknown> }): void {
-    // Process ack — free confirmed outbound frames
+    // Process ack — free confirmed outbound frames (DEL-1: rcBuffer stores { frame, ts })
     if (frame.ack > this.rcLastAckedSeq) {
       for (let i = this.rcLastAckedSeq + 1; i <= frame.ack; i++) this.rcBuffer.delete(i);
       this.rcLastAckedSeq = frame.ack;
@@ -470,12 +490,25 @@ export class DelegateConnection extends EventEmitter {
   }
 
   private resendBufferedAfter(afterSeq: number): void {
+    // DEL-1: Drop stale frames before resending
+    const now = Date.now();
+    let staleCount = 0;
+    for (const [seq, entry] of this.rcBuffer) {
+      if (now - entry.ts > DelegateConnection.RC_MAX_BUFFER_AGE) {
+        this.rcBuffer.delete(seq);
+        staleCount++;
+      }
+    }
+    if (staleCount > 0) {
+      console.warn(`[Connection] Dropped ${staleCount} stale RC frame(s) (age > ${DelegateConnection.RC_MAX_BUFFER_AGE}ms)`);
+    }
+
     const toResend = [...this.rcBuffer.entries()]
       .filter(([seq]) => seq > afterSeq)
       .sort(([a], [b]) => a - b);
-    for (const [, frame] of toResend) {
+    for (const [, entry] of toResend) {
       try {
-        this.ws?.send(JSON.stringify(frame));
+        this.ws?.send(JSON.stringify(entry.frame));
       } catch {
         break; // Transport failed — stop resending
       }
@@ -825,10 +858,20 @@ export class DelegateConnection extends EventEmitter {
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    this.pongReceived = true; // DEL-4: reset
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
+        // DEL-4: Check WS-level pong before sending next ping
+        if (!this.pongReceived) {
+          console.error('[Connection] No WS pong received — terminating dead connection');
+          this.ws.terminate();
+          return;
+        }
+        this.pongReceived = false;
+
         try {
-          this.send({ type: 'ping', timestamp: Date.now() });
+          this.ws.ping(); // DEL-4: WS-level ping for dead connection detection
+          this.send({ type: 'ping', timestamp: Date.now() }); // app-level (compat)
         } catch {
           // Ignore send errors — disconnect handler will take care of it
         }

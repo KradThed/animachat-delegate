@@ -11,19 +11,22 @@ import { DelegateConfigSchema, type DelegateConfig } from './types.js';
  * Resolve environment variable references in strings.
  * Replaces ${VAR_NAME} with the value of process.env.VAR_NAME.
  */
-function resolveEnvVars(value: unknown): unknown {
+function resolveEnvVars(value: unknown, missingVars?: string[]): unknown {
   if (typeof value === 'string') {
     return value.replace(/\$\{(\w+)\}/g, (_, varName) => {
+      if (!(varName in process.env)) {
+        missingVars?.push(varName);
+      }
       return process.env[varName] || '';
     });
   }
   if (Array.isArray(value)) {
-    return value.map(resolveEnvVars);
+    return value.map(v => resolveEnvVars(v, missingVars));
   }
   if (value && typeof value === 'object') {
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      result[k] = resolveEnvVars(v);
+      result[k] = resolveEnvVars(v, missingVars);
     }
     return result;
   }
@@ -43,8 +46,13 @@ export function loadConfig(configPath: string): DelegateConfig {
   const raw = readFileSync(resolved, 'utf-8');
   const parsed = YAML.parse(raw);
 
-  // Resolve environment variables
-  const withEnv = resolveEnvVars(parsed);
+  // Resolve environment variables (DEL-15: track missing vars)
+  const missingVars: string[] = [];
+  const withEnv = resolveEnvVars(parsed, missingVars);
+  if (missingVars.length > 0) {
+    const unique = [...new Set(missingVars)];
+    console.warn(`[Config] WARNING: unresolved env vars: ${unique.join(', ')}`);
+  }
 
   // Validate
   const result = DelegateConfigSchema.safeParse(withEnv);

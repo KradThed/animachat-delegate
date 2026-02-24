@@ -17,6 +17,7 @@ import { findConfigPath, loadConfig } from './config.js';
 import { DelegateConnection } from './connection.js';
 import { McpHostManager } from './mcp-host.js';
 import { WebhookServer } from './webhook-server.js';
+import { withLock } from './config-utils.js'; // DEL-11
 import type { ToolCallRequest } from './types.js';
 
 // =============================================================================
@@ -373,38 +374,41 @@ function writeConfigYaml(
   namespace: string,
   deps: { existsSync: any; readFileSync: any; writeFileSync: any; renameSync: any; chmodSync: any; YAML: any; resolve: any },
 ) {
-  let config: any;
+  // DEL-11: Use lock to prevent TOCTOU with concurrent config writers
+  withLock(configPath, () => {
+    let config: any;
 
-  if (deps.existsSync(configPath)) {
-    // Preserve existing config, update auth fields
-    const raw = deps.readFileSync(configPath, 'utf-8');
-    config = deps.YAML.parse(raw) || {};
-    if (!config.server) config.server = {};
-    config.server.url = serverUrl;
-    config.server.token = apiKey;
-    if (!config.delegate) config.delegate = {};
-    config.delegate.id = namespace;
-    if (!config.delegate.capabilities) config.delegate.capabilities = ['mcp_host'];
-  } else {
-    // Create new config
-    config = {
-      server: { url: serverUrl, token: apiKey },
-      delegate: { id: namespace, capabilities: ['mcp_host'] },
-      mcp_servers: [],
-      webhooks: { enabled: false, port: 8080, endpoints: [] },
-    };
-  }
+    if (deps.existsSync(configPath)) {
+      // Preserve existing config, update auth fields
+      const raw = deps.readFileSync(configPath, 'utf-8');
+      config = deps.YAML.parse(raw) || {};
+      if (!config.server) config.server = {};
+      config.server.url = serverUrl;
+      config.server.token = apiKey;
+      if (!config.delegate) config.delegate = {};
+      config.delegate.id = namespace;
+      if (!config.delegate.capabilities) config.delegate.capabilities = ['mcp_host'];
+    } else {
+      // Create new config
+      config = {
+        server: { url: serverUrl, token: apiKey },
+        delegate: { id: namespace, capabilities: ['mcp_host'] },
+        mcp_servers: [],
+        webhooks: { enabled: false, port: 8080, endpoints: [] },
+      };
+    }
 
-  const yaml = deps.YAML.stringify(config);
-  const tmpPath = configPath + '.tmp';
-  deps.writeFileSync(tmpPath, yaml, 'utf-8');
+    const yaml = deps.YAML.stringify(config);
+    const tmpPath = configPath + '.tmp';
+    deps.writeFileSync(tmpPath, yaml, 'utf-8');
 
-  // chmod 600 on Unix (best effort on Windows)
-  if (process.platform !== 'win32') {
-    try { deps.chmodSync(tmpPath, 0o600); } catch {}
-  }
+    // chmod 600 on Unix (best effort on Windows)
+    if (process.platform !== 'win32') {
+      try { deps.chmodSync(tmpPath, 0o600); } catch {}
+    }
 
-  deps.renameSync(tmpPath, configPath);
+    deps.renameSync(tmpPath, configPath);
+  });
 }
 
 // ---- Subcommand: init (full onboarding) ----
@@ -686,7 +690,7 @@ async function main(): Promise<void> {
 
   // Load config
   const configPath = findConfigPath(opts.config);
-  const config = loadConfig(configPath);
+  let config = loadConfig(configPath);
 
   // Fix #3: Ensure all MCP servers have persistent IDs (auto-generate if missing)
   const { ensureServerIds } = await import('./config-utils.js');
@@ -732,6 +736,12 @@ async function main(): Promise<void> {
 
   // ---- TelemetryBus ----
   const bus = new TelemetryBus();
+
+  // DEL-12: Wire MCP server crash detection to telemetry
+  mcpHost.onServerDied = (name) => {
+    bus.pushError(`MCP server "${name}" crashed`, name);
+    bus.setTools(mcpHost.getAllToolsWithServer().map(t => ({ name: t.name, server: (t as any).serverName || '' })));
+  };
 
   bus.setSetupStep('config', 'ok', configPath);
   bus.setSetupStep('mcp_servers', tools.length > 0 ? 'ok' : 'error',
@@ -865,13 +875,14 @@ async function main(): Promise<void> {
 
       const handler = (msg: any) => {
         if (msg.requestId === requestId) {
+          clearTimeout(timeout); // DEL-9: prevent timer leak
           connection.removeListener('mcpl_scope_elevate_result', handler);
           resolve({ approved: msg.approved, newCapabilities: msg.newCapabilities });
         }
       };
       connection.on('mcpl_scope_elevate_result', handler);
 
-      setTimeout(() => {
+      const timeout = setTimeout(() => {
         connection.removeListener('mcpl_scope_elevate_result', handler);
         resolve({ approved: false });
       }, 65_000);
@@ -902,6 +913,7 @@ async function main(): Promise<void> {
       }
 
       const freshConfig = loadConfig(findConfigPath(opts.config));
+      config = freshConfig; // DEL-8: update closure reference so acceptsMcplContext stays current
       await mcpHost.stopAll();
       await mcpHost.startAll(freshConfig.mcp_servers);
 
