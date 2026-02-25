@@ -715,6 +715,7 @@ async function main(): Promise<void> {
 
   // ---- MCP Host Manager ----
   const mcpHost = new McpHostManager();
+  mcpHost.setMcpConfigs(config.mcp_servers);
   await mcpHost.startAll(config.mcp_servers);
   const tools = mcpHost.getAllToolsWithServer();
 
@@ -740,8 +741,44 @@ async function main(): Promise<void> {
   // DEL-12: Wire MCP server crash detection to telemetry
   mcpHost.onServerDied = (name) => {
     bus.pushError(`MCP server "${name}" crashed`, name);
-    bus.setTools(mcpHost.getAllToolsWithServer().map(t => ({ name: t.name, server: (t as any).serverName || '' })));
+    handleToolsetChange('server_crashed', name);
   };
+
+  // Feature 3: Notify server when toolset changes (enable/disable/restart/crash)
+  mcpHost.onToolsetChanged = (reason, serverName) => {
+    handleToolsetChange(reason, serverName);
+  };
+
+  function handleToolsetChange(reason: string, serverName: string): void {
+    const newTools = mcpHost.getAllToolsWithServer();
+    bus.setTools(newTools.map(t => ({ name: t.name, server: (t as any).serverName || '' })));
+
+    // Re-send tool manifest so server knows about new toolset (Feature 4: with reason for history)
+    if (connection.isConnected) {
+      const warnings = mcpHost.getDuplicateWarnings();
+      connection.sendToolManifest(newTools, warnings.length > 0 ? warnings : undefined, `${reason}:${serverName}`);
+
+      // Feature 3+4: Send push event with toolset change context
+      if (connection.isMcpl) {
+        connection.sendPushEvent({
+          id: randomUUID(),
+          source: 'delegate',
+          conversationId: '',  // broadcast — not conversation-specific
+          eventType: 'toolset_changed',
+          payload: {
+            reason,
+            serverName,
+            tools: newTools.map(t => ({
+              name: t.name,
+              server: (t as any).serverName || 'virtual',
+            })),
+          },
+          systemMessage: `Delegate toolset changed (${reason}: ${serverName}). ${newTools.length} tools now available.`,
+          idempotencyKey: `toolset-${reason}-${serverName}-${Date.now()}`,
+        });
+      }
+    }
+  }
 
   bus.setSetupStep('config', 'ok', configPath);
   bus.setSetupStep('mcp_servers', tools.length > 0 ? 'ok' : 'error',
@@ -767,7 +804,7 @@ async function main(): Promise<void> {
     const currentTools = mcpHost.getAllToolsWithServer();
     if (currentTools.length > 0) {
       const warnings = mcpHost.getDuplicateWarnings();
-      connection.sendToolManifest(currentTools, warnings.length > 0 ? warnings : undefined);
+      connection.sendToolManifest(currentTools, warnings.length > 0 ? warnings : undefined, 'initial');
       bus.setSetupStep('manifest', 'ok', `${currentTools.length} tools`);
     } else {
       bus.setSetupStep('manifest', 'error', 'No tools to advertise');
@@ -862,28 +899,48 @@ async function main(): Promise<void> {
     return new Promise((resolve) => {
       const requestId = randomUUID();
 
-      connection.sendScopeElevateRequest({
-        requestId,
-        delegateId: config.delegate.id,
-        serverId: '',
-        conversationId: '',
-        featureSet: String(input.featureSet || ''),
-        label: String(input.label || ''),
-        requestedCapabilities: (input.capabilities as string[]) || [],
-        reason: String(input.reason || ''),
-      });
+      // D-3: Wrap send in try/catch — if WS is disconnected, resolve with denied
+      try {
+        connection.sendScopeElevateRequest({
+          requestId,
+          delegateId: config.delegate.id,
+          serverId: '',
+          conversationId: '',
+          featureSet: String(input.featureSet || ''),
+          label: String(input.label || ''),
+          requestedCapabilities: (input.capabilities as string[]) || [],
+          reason: String(input.reason || ''),
+        });
+      } catch (err) {
+        console.warn(`[Delegate] Scope elevate send failed: ${err instanceof Error ? err.message : String(err)}`);
+        resolve({ approved: false });
+        return;
+      }
+
+      // BUG-5 fix: clean up all listeners + timers on any resolution path
+      const cleanup = () => {
+        clearTimeout(timeout);
+        connection.removeListener('mcpl_scope_elevate_result', handler);
+        connection.removeListener('disconnected', onDisconnect);
+      };
 
       const handler = (msg: any) => {
         if (msg.requestId === requestId) {
-          clearTimeout(timeout); // DEL-9: prevent timer leak
-          connection.removeListener('mcpl_scope_elevate_result', handler);
+          cleanup();
           resolve({ approved: msg.approved, newCapabilities: msg.newCapabilities });
         }
       };
+
+      const onDisconnect = () => {
+        cleanup();
+        resolve({ approved: false });
+      };
+
       connection.on('mcpl_scope_elevate_result', handler);
+      connection.once('disconnected', onDisconnect);
 
       const timeout = setTimeout(() => {
-        connection.removeListener('mcpl_scope_elevate_result', handler);
+        cleanup();
         resolve({ approved: false });
       }, 65_000);
     });
@@ -913,12 +970,16 @@ async function main(): Promise<void> {
       }
 
       const freshConfig = loadConfig(findConfigPath(opts.config));
-      config = freshConfig; // DEL-8: update closure reference so acceptsMcplContext stays current
+      mcpHost.setMcpConfigs(freshConfig.mcp_servers);
       await mcpHost.stopAll();
       await mcpHost.startAll(freshConfig.mcp_servers);
+      // BUG-1 fix: update config AFTER servers are fully started.
+      // Prevents race where tool_call_request reads new acceptsMcplContext
+      // while servers are still restarting (between stopAll/startAll yields).
+      config = freshConfig;
 
       const newTools = mcpHost.getAllToolsWithServer();
-      connection.sendToolManifest(newTools);
+      connection.sendToolManifest(newTools, undefined, 'config_reload');
       bus.setTools(newTools.map(t => ({ name: t.name, server: (t as any).serverName || '' })));
       bus.setSetupStep('reload', 'ok', `${newTools.length} tools`);
     } catch (err: any) {
@@ -931,7 +992,7 @@ async function main(): Promise<void> {
   // ---- Webhook Server ----
   let webhookServer: WebhookServer | null = null;
   if (config.webhooks.enabled && config.webhooks.endpoints.length > 0) {
-    webhookServer = new WebhookServer(connection);
+    webhookServer = new WebhookServer(connection, config.webhooks.rateLimits);
     webhookServer.start(config.webhooks.port, config.webhooks.endpoints);
   }
 

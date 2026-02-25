@@ -10,6 +10,7 @@ import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import { ServerMessageSchema, type ServerMessage, type ToolCallRequest } from './types.js';
 import type { McplCapability, McplAck, McplFeatureSet } from './mcpl-types.js';
+import { McplCodec } from './mcpl-codec.js';
 
 // =============================================================================
 // Types
@@ -66,6 +67,8 @@ export class DelegateConnection extends EventEmitter {
   private mcplSessionId: string | null = null;
   /** Negotiated MCPL feature sets per serverId */
   private _featureSets: Record<string, McplFeatureSet> = {};
+  /** JSON-RPC 2.0 codec for MCPL messages (created after hello/ack handshake) */
+  private mcplCodec: McplCodec | null = null;
 
   // ReliableChannel state (embedded — option C from plan)
   private rcOutSeq = 0;
@@ -87,7 +90,9 @@ export class DelegateConnection extends EventEmitter {
   /** DEL-2: Redact auth tokens from URLs for safe logging */
   private static redactUrl(url: string): string {
     return url
-      .replace(/([?&])(apiKey|token)=[^&]*/gi, '$1$2=[REDACTED]');
+      .replace(/([?&])(apiKey|token)=[^&]*/gi, '$1$2=[REDACTED]')
+      // BUG-10 fix: also redact dak_* API key tokens appearing in URL path
+      .replace(/\bdak_[A-Za-z0-9_-]+/g, '[REDACTED]');
   }
 
   constructor(options: ConnectionOptions) {
@@ -135,13 +140,19 @@ export class DelegateConnection extends EventEmitter {
    * Send a message to the server.
    * MCPL messages (except mcpl/hello) are wrapped in ReliableChannel frames.
    * Legacy messages and mcpl/hello are sent raw.
+   *
+   * IMPORTANT: All mcpl/* messages (except mcpl/hello) are IMPLICITLY wrapped in
+   * ReliableChannel seq/ack framing AND encoded to JSON-RPC 2.0 via McplCodec.
+   * Any new mcpl/* message type MUST be sent via this.send(), never via
+   * this.ws.send() directly — otherwise it bypasses RC ordering guarantees
+   * and the JSON-RPC 2.0 wire format.
    */
   send(message: Record<string, unknown>): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('Not connected');
     }
 
-    // Frame MCPL messages (except mcpl/hello which is sent before RC exists)
+    // Frame MCPL messages (except mcpl/hello which is sent before RC/codec exists)
     if (
       this._isMcpl &&
       typeof message.type === 'string' &&
@@ -154,10 +165,19 @@ export class DelegateConnection extends EventEmitter {
         this.ws.close(1008, 'backpressure: too many unacked frames');
         return;
       }
+      // Encode internal format → JSON-RPC 2.0 via codec
+      const wireMsg = this.mcplCodec ? this.mcplCodec.encode(message) : message;
       const seq = ++this.rcOutSeq;
-      const frame = { seq, ack: this.rcInSeq, payload: message };
+      const frame = { seq, ack: this.rcInSeq, payload: wireMsg };
       this.rcBuffer.set(seq, { frame, ts: Date.now() });
-      this.ws.send(JSON.stringify(frame));
+      // BUG-9 fix: ws.send() can throw if socket closes between readyState check
+      // and actual send. Wrap in try/catch — frame is buffered for resend on resume.
+      try {
+        this.ws.send(JSON.stringify(frame));
+      } catch {
+        // Frame is in rcBuffer — will be resent on reconnect
+        return;
+      }
       // Cancel pending bare ack (piggybacked ack on this frame)
       if (this.rcBareAckTimer) {
         clearTimeout(this.rcBareAckTimer);
@@ -174,15 +194,19 @@ export class DelegateConnection extends EventEmitter {
    */
   sendToolManifest(
     tools: Array<{ name: string; description: string; inputSchema: unknown; serverName?: string }>,
-    warnings?: Array<{ toolName: string; fromServer: string; conflictsWith: string }>
+    warnings?: Array<{ toolName: string; fromServer: string; conflictsWith: string }>,
+    /** Optional reason for manifest update (Feature 4: toolset history tracking) */
+    reason?: string,
   ): void {
     this.send({
       type: 'tool_manifest',
       delegateId: this.options.delegateId,
       tools,
+      timestamp: new Date().toISOString(),
+      ...(reason ? { reason } : {}),
       ...(warnings?.length ? { warnings } : {}),
     });
-    console.log(`[Connection] Sent tool manifest: ${tools.length} tools (${tools.map(t => t.name).join(', ')})`);
+    console.log(`[Connection] Sent tool manifest: ${tools.length} tools (${tools.map(t => t.name).join(', ')})${reason ? ` [${reason}]` : ''}`);
     if (warnings?.length) {
       console.warn(`[Connection] Included ${warnings.length} duplicate warning(s) in manifest`);
     }
@@ -296,8 +320,10 @@ export class DelegateConnection extends EventEmitter {
               // If MCPL capabilities are configured, send mcpl/hello
               if (this.options.mcplCapabilities && this.options.mcplCapabilities.length > 0) {
                 console.log(`[Connection] Auth OK, sending mcpl/hello (capabilities: ${this.options.mcplCapabilities.join(', ')})`);
+                const helloRequestId = `hello-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                 this.send({
                   type: 'mcpl/hello',
+                  requestId: helloRequestId,
                   protocolVersion: 'mcpl-1.0',
                   capabilities: this.options.mcplCapabilities,
                   delegateId: this.options.delegateId,
@@ -329,15 +355,20 @@ export class DelegateConnection extends EventEmitter {
             return;
           }
 
-          // Handle mcpl/ack during authentication phase — may arrive as frame on resume
-          if (msg.type === 'mcpl/ack') {
-            // Plain mcpl/ack (new session, no framing yet)
+          // Handle mcpl/ack during authentication phase.
+          // Server sends ack as JSON-RPC 2.0 response: { jsonrpc: "2.0", id, result: { sessionId, ... } }
+          // May arrive plain (new session) or framed in RC (resume).
+
+          // 1. Plain JSON-RPC response (new session, no framing yet)
+          if (msg.jsonrpc === '2.0' && 'result' in msg && !('seq' in msg)) {
+            const ackPayload = msg.result as Record<string, unknown>;
             if (!trySettle()) return; // DEL-3
-            this.handleMcplAckAuth(msg, resolve);
+            this.handleMcplAckAuth(ackPayload, resolve);
             return;
           }
-          if (typeof msg.seq === 'number' && msg.payload?.type === 'mcpl/ack') {
-            // Framed mcpl/ack (resume — server already has RC state)
+
+          // 2. Framed JSON-RPC response (resume — server already has RC state)
+          if (typeof msg.seq === 'number' && msg.payload?.jsonrpc === '2.0' && 'result' in (msg.payload as any)) {
             // Process ack from frame
             if (msg.ack > this.rcLastAckedSeq) {
               for (let i = this.rcLastAckedSeq + 1; i <= msg.ack; i++) this.rcBuffer.delete(i);
@@ -346,12 +377,12 @@ export class DelegateConnection extends EventEmitter {
             this.rcInSeq = msg.seq;
 
             if (!trySettle()) return; // DEL-3
-            const ackMsg = msg.payload;
+            const ackPayload = (msg.payload as any).result as Record<string, unknown>;
             // If resumedFromSeq present — resend buffered frames
-            if (typeof ackMsg.resumedFromSeq === 'number') {
-              this.resendBufferedAfter(ackMsg.resumedFromSeq);
+            if (typeof ackPayload.resumedFromSeq === 'number') {
+              this.resendBufferedAfter(ackPayload.resumedFromSeq);
             }
-            this.handleMcplAckAuth(ackMsg, resolve);
+            this.handleMcplAckAuth(ackPayload, resolve);
             return;
           }
         }
@@ -421,6 +452,14 @@ export class DelegateConnection extends EventEmitter {
     this.mcplSessionId = ackMsg.sessionId;
     this._featureSets = ackMsg.featureSets || {};
 
+    // Initialize JSON-RPC codec for subsequent MCPL messages.
+    // On resume: preserve pending requests from previous codec (BUG 6+7 fix).
+    const previousPending = this.mcplCodec?.getPendingRequests();
+    this.mcplCodec = new McplCodec();
+    if (previousPending && previousPending.length > 0) {
+      this.mcplCodec.restorePendingRequests(previousPending);
+    }
+
     // If no resumedFromSeq → new session, reset RC state
     if (typeof ackMsg.resumedFromSeq !== 'number') {
       this.rcOutSeq = 0;
@@ -434,7 +473,15 @@ export class DelegateConnection extends EventEmitter {
     this.setState('connected');
     this.startHeartbeat();
     console.log(`[Connection] MCPL connected! session=${ackMsg.sessionId}, capabilities: ${(ackMsg.negotiatedCapabilities || []).join(', ')}${typeof ackMsg.resumedFromSeq === 'number' ? ' (resumed)' : ''}`);
-    this.emit('connected', this.sessionId!, this.userId!);
+    // BUG-6 fix: guard against null sessionId/userId (set during delegate_auth_result).
+    // Should never be null here, but if auth_result had missing fields, non-null assertion
+    // would mask the problem. Defensive check + clear error is safer.
+    if (!this.sessionId || !this.userId) {
+      console.error('[Connection] MCPL ack received but sessionId or userId is null — auth_result was incomplete');
+      this.ws?.close(4500, 'incomplete_auth');
+      return;
+    }
+    this.emit('connected', this.sessionId, this.userId);
     this.emit('mcpl_ack', ackMsg);
     resolve();
   }
@@ -464,15 +511,32 @@ export class DelegateConnection extends EventEmitter {
 
     // In-order delivery + drain buffered successors
     this.rcInSeq = frame.seq;
-    this.handleMcplMessage(frame.payload as any);
+    this.dispatchMcplPayload(frame.payload);
 
+    // D-4: Safe drain — avoid non-null assertion on Map.get()
     while (this.rcPending.has(this.rcInSeq + 1)) {
       this.rcInSeq++;
-      this.handleMcplMessage(this.rcPending.get(this.rcInSeq)! as any);
+      const payload = this.rcPending.get(this.rcInSeq);
       this.rcPending.delete(this.rcInSeq);
+      if (payload) this.dispatchMcplPayload(payload);
     }
 
     this.scheduleBareAck();
+  }
+
+  /**
+   * Decode an RC payload (JSON-RPC 2.0 or legacy) and dispatch to handleMcplMessage.
+   */
+  private dispatchMcplPayload(payload: Record<string, unknown>): void {
+    if (this.mcplCodec) {
+      const decoded = this.mcplCodec.decode(payload);
+      if (decoded) {
+        this.handleMcplMessage(decoded as any);
+        return;
+      }
+    }
+    // Fallback: no codec or codec returned null (legacy/unrecognized)
+    this.handleMcplMessage(payload as any);
   }
 
   private scheduleBareAck(): void {

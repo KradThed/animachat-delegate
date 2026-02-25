@@ -479,10 +479,15 @@ describe('McpHostManager', () => {
       await manager.startAll([makeConfig('my-server')]);
 
       const tools = manager.getAllToolsWithServer();
-      expect(tools).toHaveLength(2);
-      for (const tool of tools) {
+      // 2 server tools + 4 MCP management virtual tools
+      const serverTools = tools.filter(t => !t.name.startsWith('_mcp_'));
+      expect(serverTools).toHaveLength(2);
+      for (const tool of serverTools) {
         expect(tool.serverName).toBe('my-server');
       }
+      // MCP management tools always present
+      const mgmtTools = tools.filter(t => t.name.startsWith('_mcp_'));
+      expect(mgmtTools).toHaveLength(4);
 
       logSpy.mockRestore();
     });
@@ -694,6 +699,224 @@ describe('McpHostManager', () => {
       expect(handler2).toHaveBeenCalledTimes(1);
       expect(handler1).toHaveBeenCalledTimes(1); // not called again
       expect(JSON.parse(result.content)).toEqual({ approved: true, newCapabilities: ['full'] });
+    });
+  });
+
+  // =========================================================================
+  // MCP Management Virtual Tools
+  // =========================================================================
+
+  describe('MCP management virtual tools', () => {
+    const echoConfig = makeConfig('echo');
+    const statefulConfig = makeConfig('stateful');
+
+    describe('_mcp_list_servers', () => {
+      it('lists configured servers with running status', async () => {
+        mockListTools.mockResolvedValue({ tools: [makeToolDef('tool_a')] });
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+        manager.setMcpConfigs([echoConfig, statefulConfig]);
+        await manager.startAll([echoConfig, statefulConfig]);
+
+        const result = await manager.callTool('_mcp_list_servers', {});
+        expect(result.isError).toBe(false);
+        const servers = JSON.parse(result.content);
+        expect(servers).toHaveLength(2);
+        expect(servers[0].name).toBe('echo');
+        expect(servers[0].status).toBe('running');
+        expect(servers[1].name).toBe('stateful');
+        expect(servers[1].status).toBe('running');
+
+        logSpy.mockRestore();
+      });
+
+      it('shows stopped status for servers not yet started', async () => {
+        manager.setMcpConfigs([echoConfig, statefulConfig]);
+        // Don't start any servers
+
+        const result = await manager.callTool('_mcp_list_servers', {});
+        const servers = JSON.parse(result.content);
+        expect(servers).toHaveLength(2);
+        expect(servers.every((s: any) => s.status === 'stopped')).toBe(true);
+        expect(servers.every((s: any) => s.toolCount === 0)).toBe(true);
+      });
+
+      it('returns empty array when no configs set', async () => {
+        const result = await manager.callTool('_mcp_list_servers', {});
+        const servers = JSON.parse(result.content);
+        expect(servers).toEqual([]);
+      });
+    });
+
+    describe('_mcp_enable_server', () => {
+      it('starts a stopped server from config', async () => {
+        mockListTools.mockResolvedValue({ tools: [makeToolDef('echo_tool')] });
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const onToolsetChanged = vi.fn();
+        manager.onToolsetChanged = onToolsetChanged;
+
+        manager.setMcpConfigs([echoConfig]);
+
+        const result = await manager.callTool('_mcp_enable_server', { serverName: 'echo' });
+        expect(result.isError).toBe(false);
+        const parsed = JSON.parse(result.content);
+        expect(parsed.status).toBe('started');
+        expect(parsed.serverName).toBe('echo');
+        expect(parsed.toolCount).toBe(1);
+        expect(onToolsetChanged).toHaveBeenCalledWith('server_enabled', 'echo');
+
+        logSpy.mockRestore();
+      });
+
+      it('returns already_running if server is up', async () => {
+        mockListTools.mockResolvedValue({ tools: [makeToolDef('echo_tool')] });
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+        manager.setMcpConfigs([echoConfig]);
+        await manager.startAll([echoConfig]);
+
+        const result = await manager.callTool('_mcp_enable_server', { serverName: 'echo' });
+        expect(result.isError).toBe(false);
+        const parsed = JSON.parse(result.content);
+        expect(parsed.status).toBe('already_running');
+
+        logSpy.mockRestore();
+      });
+
+      it('returns error for unknown server name', async () => {
+        manager.setMcpConfigs([echoConfig]);
+
+        const result = await manager.callTool('_mcp_enable_server', { serverName: 'nonexistent' });
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('not found in config');
+      });
+
+      it('returns error when serverName is empty', async () => {
+        const result = await manager.callTool('_mcp_enable_server', { serverName: '' });
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('Missing required parameter');
+      });
+    });
+
+    describe('_mcp_disable_server', () => {
+      it('stops a running server', async () => {
+        mockListTools.mockResolvedValue({ tools: [makeToolDef('echo_tool')] });
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const onToolsetChanged = vi.fn();
+        manager.onToolsetChanged = onToolsetChanged;
+
+        manager.setMcpConfigs([echoConfig]);
+        await manager.startAll([echoConfig]);
+
+        const result = await manager.callTool('_mcp_disable_server', { serverName: 'echo' });
+        expect(result.isError).toBe(false);
+        const parsed = JSON.parse(result.content);
+        expect(parsed.status).toBe('stopped');
+        expect(onToolsetChanged).toHaveBeenCalledWith('server_disabled', 'echo');
+
+        // Verify server is no longer in tool map
+        expect(manager.getToolServerMap().has('echo_tool')).toBe(false);
+
+        logSpy.mockRestore();
+      });
+
+      it('returns error when server is not running', async () => {
+        const result = await manager.callTool('_mcp_disable_server', { serverName: 'echo' });
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('is not running');
+      });
+
+      it('returns error when serverName is empty', async () => {
+        const result = await manager.callTool('_mcp_disable_server', { serverName: '' });
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('Missing required parameter');
+      });
+    });
+
+    describe('_mcp_restart_server', () => {
+      it('restarts a running server', async () => {
+        mockListTools.mockResolvedValue({ tools: [makeToolDef('echo_tool')] });
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const onToolsetChanged = vi.fn();
+        manager.onToolsetChanged = onToolsetChanged;
+
+        manager.setMcpConfigs([echoConfig]);
+        await manager.startAll([echoConfig]);
+
+        const result = await manager.callTool('_mcp_restart_server', { serverName: 'echo' });
+        expect(result.isError).toBe(false);
+        const parsed = JSON.parse(result.content);
+        expect(parsed.status).toBe('restarted');
+        expect(parsed.serverName).toBe('echo');
+        expect(mockClose).toHaveBeenCalled(); // old server closed
+        expect(onToolsetChanged).toHaveBeenCalledWith('server_restarted', 'echo');
+
+        logSpy.mockRestore();
+      });
+
+      it('starts a stopped server (not yet running)', async () => {
+        mockListTools.mockResolvedValue({ tools: [makeToolDef('echo_tool')] });
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+        manager.setMcpConfigs([echoConfig]);
+
+        const result = await manager.callTool('_mcp_restart_server', { serverName: 'echo' });
+        expect(result.isError).toBe(false);
+        const parsed = JSON.parse(result.content);
+        expect(parsed.status).toBe('restarted');
+
+        logSpy.mockRestore();
+      });
+
+      it('returns error for unknown server name', async () => {
+        manager.setMcpConfigs([echoConfig]);
+
+        const result = await manager.callTool('_mcp_restart_server', { serverName: 'nonexistent' });
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('not found in config');
+      });
+
+      it('returns error when serverName is empty', async () => {
+        const result = await manager.callTool('_mcp_restart_server', { serverName: '' });
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('Missing required parameter');
+      });
+
+      it('handles spawn failure gracefully', async () => {
+        mockConnect.mockRejectedValue(new Error('spawn ENOENT'));
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        manager.setMcpConfigs([echoConfig]);
+
+        const result = await manager.callTool('_mcp_restart_server', { serverName: 'echo' });
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain('Restart server "echo" failed');
+
+        logSpy.mockRestore();
+        errorSpy.mockRestore();
+      });
+    });
+
+    describe('getAllToolsWithServer includes management tools', () => {
+      it('always includes 4 management tools even without servers', () => {
+        const tools = manager.getAllToolsWithServer();
+        const mgmtNames = tools.filter(t => t.name.startsWith('_mcp_')).map(t => t.name);
+        expect(mgmtNames).toEqual([
+          '_mcp_list_servers',
+          '_mcp_enable_server',
+          '_mcp_disable_server',
+          '_mcp_restart_server',
+        ]);
+      });
+
+      it('management tools have no serverName (virtual)', () => {
+        const tools = manager.getAllToolsWithServer();
+        const mgmt = tools.filter(t => t.name.startsWith('_mcp_'));
+        for (const tool of mgmt) {
+          expect(tool.serverName).toBeUndefined();
+        }
+      });
     });
   });
 });

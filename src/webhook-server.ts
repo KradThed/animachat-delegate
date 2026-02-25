@@ -24,18 +24,25 @@ interface ParsedPayload {
 // WebhookServer
 // =============================================================================
 
+export interface WebhookRateLimitConfig {
+  windowMs: number;
+  maxPerWindow: number;
+}
+
 export class WebhookServer {
   private app: express.Application;
   private httpServer: ReturnType<typeof this.app.listen> | null = null;
   private connection: DelegateConnection;
 
-  // DEL-5: Per-endpoint rate limiting
+  // DEL-5: Per-endpoint rate limiting (configurable via delegate.yaml)
   private rateLimits = new Map<string, number[]>();
-  private static readonly RATE_WINDOW_MS = 60_000;
-  private static readonly RATE_MAX = 60;
+  private rateWindowMs: number;
+  private rateMax: number;
 
-  constructor(connection: DelegateConnection) {
+  constructor(connection: DelegateConnection, rateLimitConfig?: WebhookRateLimitConfig) {
     this.connection = connection;
+    this.rateWindowMs = rateLimitConfig?.windowMs ?? 60_000;
+    this.rateMax = rateLimitConfig?.maxPerWindow ?? 60;
     this.app = express();
     // DEL-6: Capture raw body for HMAC signature verification
     this.app.use(express.json({
@@ -346,13 +353,26 @@ export class WebhookServer {
   }
 
   // DEL-5: Sliding window rate limiter
+  // D-7: Delete empty entries to prevent unbounded Map growth from unique IPs
   private checkRateLimit(key: string): boolean {
     const now = Date.now();
     const timestamps = this.rateLimits.get(key) || [];
-    const recent = timestamps.filter(t => now - t < WebhookServer.RATE_WINDOW_MS);
-    if (recent.length >= WebhookServer.RATE_MAX) return false;
+    const recent = timestamps.filter(t => now - t < this.rateWindowMs);
+    if (recent.length >= this.rateMax) return false;
     recent.push(now);
     this.rateLimits.set(key, recent);
+
+    // BUG-8 fix: deterministic cleanup when Map exceeds threshold.
+    // Previous probabilistic approach (Math.random() < 0.01) could let Map grow
+    // unboundedly under DDoS with many unique IPs.
+    if (this.rateLimits.size > 100) {
+      for (const [k, ts] of this.rateLimits) {
+        if (ts.every(t => now - t >= this.rateWindowMs)) {
+          this.rateLimits.delete(k);
+        }
+      }
+    }
+
     return true;
   }
 

@@ -316,13 +316,15 @@ describe('interactiveMcpAdd', () => {
 
   it('returns false and logs error when server name already exists', async () => {
     mockPromptSelect.mockResolvedValue(1); // memory
-    mockReadConfigRaw.mockReturnValue({
-      path: '/path/to/delegate.yaml',
-      data: {
+    // BUG-11: duplicate check now runs inside updateConfig callback (under lock).
+    // Mock updateConfig to execute the callback with a config that already has "memory".
+    mockUpdateConfig.mockImplementation((_path: any, cb: any) => {
+      const config = {
         mcp_servers: [
           { name: 'memory', command: 'npx', args: ['-y', '@modelcontextprotocol/server-memory'] },
         ],
-      },
+      };
+      cb(config);
     });
 
     const result = await interactiveMcpAdd();
@@ -331,7 +333,6 @@ describe('interactiveMcpAdd', () => {
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining('MCP server "memory" already exists'),
     );
-    expect(mockUpdateConfig).not.toHaveBeenCalled();
   });
 
   // ─── Config doesn't exist yet (catch branch) ─────────────────
@@ -399,16 +400,13 @@ describe('interactiveMcpAdd', () => {
 
   // ─── Passes configPathOverride ────────────────────────────────
 
-  it('passes configPathOverride to readConfigRaw and updateConfig', async () => {
+  it('passes configPathOverride to updateConfig', async () => {
     mockPromptSelect.mockResolvedValue(1); // memory
-    mockReadConfigRaw.mockReturnValue({
-      path: '/custom/path.yaml',
-      data: { mcp_servers: [] },
-    });
 
     await interactiveMcpAdd('/custom/path.yaml');
 
-    expect(mockReadConfigRaw).toHaveBeenCalledWith('/custom/path.yaml');
+    // BUG-11: readConfigRaw is no longer called — duplicate check moved inside updateConfig.
+    expect(mockReadConfigRaw).not.toHaveBeenCalled();
     expect(mockUpdateConfig).toHaveBeenCalledWith('/custom/path.yaml', expect.any(Function));
   });
 

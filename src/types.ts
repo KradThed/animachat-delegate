@@ -111,11 +111,11 @@ export const WebhookEndpointSchema = z.object({
 
 export const DelegateConfigSchema = z.object({
   server: z.object({
-    url: z.string(),
-    token: z.string(),
+    url: z.string().min(1, 'server.url must not be empty'),
+    token: z.string().min(1, 'server.token must not be empty (check env vars)'),
   }),
   delegate: z.object({
-    id: z.string(),
+    id: z.string().min(1, 'delegate.id must not be empty'),
     capabilities: z.array(z.string()).default(['mcp_host']),
   }),
   mcp_servers: z.array(McpServerConfigSchema).default([]),
@@ -123,7 +123,11 @@ export const DelegateConfigSchema = z.object({
     enabled: z.boolean().default(false),
     port: z.number().default(8080),
     endpoints: z.array(WebhookEndpointSchema).default([]),
-  }).default({ enabled: false, port: 8080, endpoints: [] }),
+    rateLimits: z.object({
+      windowMs: z.number().default(60_000),
+      maxPerWindow: z.number().default(60),
+    }).default({ windowMs: 60_000, maxPerWindow: 60 }),
+  }).default({ enabled: false, port: 8080, endpoints: [], rateLimits: { windowMs: 60_000, maxPerWindow: 60 } }),
 });
 
 export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;

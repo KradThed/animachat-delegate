@@ -50,6 +50,59 @@ const SCOPE_ELEVATE_TOOL: ToolDefinition = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// MCP Management Virtual Tools
+// ---------------------------------------------------------------------------
+
+const MCP_LIST_SERVERS_TOOL: ToolDefinition = {
+  name: '_mcp_list_servers',
+  description: 'List all configured MCP servers, their running status, and available tools.',
+  inputSchema: { type: 'object', properties: {}, required: [] },
+};
+
+const MCP_ENABLE_SERVER_TOOL: ToolDefinition = {
+  name: '_mcp_enable_server',
+  description: 'Start a stopped MCP server by name (must exist in delegate config).',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      serverName: { type: 'string', description: 'Name of the MCP server from config' },
+    },
+    required: ['serverName'],
+  },
+};
+
+const MCP_DISABLE_SERVER_TOOL: ToolDefinition = {
+  name: '_mcp_disable_server',
+  description: 'Stop a running MCP server by name.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      serverName: { type: 'string', description: 'Name of the MCP server to stop' },
+    },
+    required: ['serverName'],
+  },
+};
+
+const MCP_RESTART_SERVER_TOOL: ToolDefinition = {
+  name: '_mcp_restart_server',
+  description: 'Stop and restart an MCP server by name. Useful after config or environment changes.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      serverName: { type: 'string', description: 'Name of the MCP server to restart' },
+    },
+    required: ['serverName'],
+  },
+};
+
+const MCP_MANAGEMENT_TOOLS = [
+  MCP_LIST_SERVERS_TOOL,
+  MCP_ENABLE_SERVER_TOOL,
+  MCP_DISABLE_SERVER_TOOL,
+  MCP_RESTART_SERVER_TOOL,
+];
+
 // =============================================================================
 // McpHostManager
 // =============================================================================
@@ -59,6 +112,12 @@ export class McpHostManager {
   private toolToServer: Map<string, string> = new Map();
   private _duplicateWarnings: DuplicateToolWarning[] = [];
   private scopeElevateHandler?: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>;
+
+  /** MCP server configs from delegate.yaml (set by setMcpConfigs, used for enable/restart) */
+  private mcpConfigs: McpServerConfig[] = [];
+
+  /** Callback when toolset changes (enable/disable/restart/crash) — used for manifest re-send + events */
+  onToolsetChanged?: (reason: string, serverName: string) => void;
 
   /** DEL-12: Callback when an MCP server process dies unexpectedly */
   onServerDied?: (serverName: string) => void;
@@ -77,6 +136,14 @@ export class McpHostManager {
    */
   setScopeElevateHandler(handler: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>): void {
     this.scopeElevateHandler = handler;
+  }
+
+  /**
+   * Store MCP server configs for enable/restart virtual tools.
+   * Called from index.ts after config load (and on reload).
+   */
+  setMcpConfigs(configs: McpServerConfig[]): void {
+    this.mcpConfigs = configs;
   }
 
   /**
@@ -169,10 +236,12 @@ export class McpHostManager {
         tools.push({ ...tool, serverName });
       }
     }
-    // Append virtual _scope_elevate tool (no serverName — it's delegate-internal)
+    // Append virtual tools (no serverName — delegate-internal)
     if (this.scopeElevateHandler) {
       tools.push(SCOPE_ELEVATE_TOOL);
     }
+    // MCP management tools always available
+    tools.push(...MCP_MANAGEMENT_TOOLS);
     return tools;
   }
 
@@ -200,6 +269,20 @@ export class McpHostManager {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: `Scope elevate failed: ${msg}`, isError: true };
       }
+    }
+
+    // Intercept MCP management virtual tools
+    if (name === '_mcp_list_servers') {
+      return this.handleMcpListServers();
+    }
+    if (name === '_mcp_enable_server') {
+      return this.handleMcpEnableServer(String(args.serverName || ''));
+    }
+    if (name === '_mcp_disable_server') {
+      return this.handleMcpDisableServer(String(args.serverName || ''));
+    }
+    if (name === '_mcp_restart_server') {
+      return this.handleMcpRestartServer(String(args.serverName || ''));
     }
 
     const serverName = this.toolToServer.get(name);
@@ -237,6 +320,151 @@ export class McpHostManager {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[McpHost] Tool call "${name}" failed:`, message);
       return { content: `Tool execution error: ${message}`, isError: true };
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // MCP Management Virtual Tool Handlers
+  // --------------------------------------------------------------------------
+
+  private handleMcpListServers(): { content: string; isError: boolean } {
+    try {
+      const configuredNames = new Set(this.mcpConfigs.map(c => c.name));
+      const result = this.mcpConfigs.map(cfg => {
+        const server = this.servers.get(cfg.name);
+        return {
+          name: cfg.name,
+          status: server ? 'running' : 'stopped',
+          toolCount: server ? server.tools.length : 0,
+          tools: server ? server.tools.map(t => t.name) : [],
+          acceptsMcplContext: cfg.acceptsMcplContext,
+        };
+      });
+
+      // Also include dynamic servers (added via SSE, not in config)
+      for (const [name, server] of this.servers) {
+        if (!configuredNames.has(name)) {
+          result.push({
+            name,
+            status: 'running',
+            toolCount: server.tools.length,
+            tools: server.tools.map(t => t.name),
+            acceptsMcplContext: false,
+          });
+        }
+      }
+
+      return { content: JSON.stringify(result, null, 2), isError: false };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: `List servers failed: ${msg}`, isError: true };
+    }
+  }
+
+  private async handleMcpEnableServer(serverName: string): Promise<{ content: string; isError: boolean }> {
+    if (!serverName) {
+      return { content: 'Missing required parameter: serverName', isError: true };
+    }
+
+    // Check if already running
+    if (this.servers.has(serverName)) {
+      const server = this.servers.get(serverName)!;
+      return {
+        content: JSON.stringify({
+          status: 'already_running',
+          serverName,
+          toolCount: server.tools.length,
+          tools: server.tools.map(t => t.name),
+        }),
+        isError: false,
+      };
+    }
+
+    // Find in config
+    const cfg = this.mcpConfigs.find(c => c.name === serverName);
+    if (!cfg) {
+      return { content: `Server "${serverName}" not found in config`, isError: true };
+    }
+
+    try {
+      await this.spawnServer(cfg);
+      this.rebuildToolList();
+      const server = this.servers.get(serverName);
+      const result = {
+        status: 'started',
+        serverName,
+        toolCount: server?.tools.length || 0,
+        tools: server?.tools.map(t => t.name) || [],
+      };
+      console.log(`[McpHost] Server "${serverName}" enabled via _mcp_enable_server`);
+      this.onToolsetChanged?.('server_enabled', serverName);
+      return { content: JSON.stringify(result), isError: false };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: `Enable server "${serverName}" failed: ${msg}`, isError: true };
+    }
+  }
+
+  private async handleMcpDisableServer(serverName: string): Promise<{ content: string; isError: boolean }> {
+    if (!serverName) {
+      return { content: 'Missing required parameter: serverName', isError: true };
+    }
+
+    const server = this.servers.get(serverName);
+    if (!server) {
+      return { content: `Server "${serverName}" is not running`, isError: true };
+    }
+
+    try {
+      await server.client.close();
+      this.servers.delete(serverName);
+      this.rebuildToolList();
+      console.log(`[McpHost] Server "${serverName}" disabled via _mcp_disable_server`);
+      this.onToolsetChanged?.('server_disabled', serverName);
+      return {
+        content: JSON.stringify({ status: 'stopped', serverName }),
+        isError: false,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: `Disable server "${serverName}" failed: ${msg}`, isError: true };
+    }
+  }
+
+  private async handleMcpRestartServer(serverName: string): Promise<{ content: string; isError: boolean }> {
+    if (!serverName) {
+      return { content: 'Missing required parameter: serverName', isError: true };
+    }
+
+    const cfg = this.mcpConfigs.find(c => c.name === serverName);
+    if (!cfg) {
+      return { content: `Server "${serverName}" not found in config`, isError: true };
+    }
+
+    try {
+      // Stop if running
+      const existingServer = this.servers.get(serverName);
+      if (existingServer) {
+        await existingServer.client.close();
+        this.servers.delete(serverName);
+      }
+
+      // Start
+      await this.spawnServer(cfg);
+      this.rebuildToolList();
+      const server = this.servers.get(serverName);
+      const result = {
+        status: 'restarted',
+        serverName,
+        toolCount: server?.tools.length || 0,
+        tools: server?.tools.map(t => t.name) || [],
+      };
+      console.log(`[McpHost] Server "${serverName}" restarted via _mcp_restart_server`);
+      this.onToolsetChanged?.('server_restarted', serverName);
+      return { content: JSON.stringify(result), isError: false };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: `Restart server "${serverName}" failed: ${msg}`, isError: true };
     }
   }
 
@@ -327,7 +555,13 @@ export class McpHostManager {
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args,
-      env: config.env ? { ...process.env, ...config.env } as Record<string, string> : undefined,
+      // BUG-12 fix: process.env values may be undefined. Filter them out instead of
+      // using unsafe `as Record<string, string>` cast which masks the type mismatch.
+      env: config.env
+        ? Object.fromEntries(
+            Object.entries({ ...process.env, ...config.env }).filter((entry): entry is [string, string] => entry[1] !== undefined)
+          )
+        : undefined,
     });
 
     const client = new Client(
@@ -372,13 +606,21 @@ export class McpHostManager {
     do {
       const result = await server.client.listTools(cursor ? { cursor } : undefined);
       for (const tool of result.tools) {
+        // D-10: Validate inputSchema — properties must be an object, required must be string[]
+        const rawSchema = tool.inputSchema as any;
+        const properties = rawSchema?.properties;
+        const required = rawSchema?.required;
         allTools.push({
           name: tool.name,
           description: tool.description || '',
           inputSchema: {
             type: 'object' as const,
-            properties: (tool.inputSchema as any)?.properties ?? {},
-            required: (tool.inputSchema as any)?.required,
+            properties: (properties && typeof properties === 'object' && !Array.isArray(properties))
+              ? properties
+              : {},
+            required: (Array.isArray(required) && required.every((r: unknown) => typeof r === 'string'))
+              ? required
+              : undefined,
           },
         });
       }

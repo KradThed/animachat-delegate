@@ -866,4 +866,50 @@ describe('WebhookServer', () => {
       expect(result.context.targetBranch).toBeUndefined();
     });
   });
+
+  // =========================================================================
+  // Configurable rate limits (Feature 1)
+  // =========================================================================
+
+  describe('configurable rate limits', () => {
+    it('uses default rate limits when no config is provided', () => {
+      const srv = new WebhookServer(createMockConnection());
+      expect((srv as any).rateWindowMs).toBe(60_000);
+      expect((srv as any).rateMax).toBe(60);
+    });
+
+    it('accepts custom rate limit config', () => {
+      const srv = new WebhookServer(createMockConnection(), {
+        windowMs: 10_000,
+        maxPerWindow: 5,
+      });
+      expect((srv as any).rateWindowMs).toBe(10_000);
+      expect((srv as any).rateMax).toBe(5);
+    });
+
+    it('enforces custom maxPerWindow limit', () => {
+      const srv = new WebhookServer(createMockConnection(), {
+        windowMs: 60_000,
+        maxPerWindow: 3,
+      });
+      const check = (key: string) => (srv as any).checkRateLimit(key);
+
+      expect(check('ip:path')).toBe(true);  // 1
+      expect(check('ip:path')).toBe(true);  // 2
+      expect(check('ip:path')).toBe(true);  // 3
+      expect(check('ip:path')).toBe(false); // 4 → blocked
+    });
+
+    it('different keys have independent limits', () => {
+      const srv = new WebhookServer(createMockConnection(), {
+        windowMs: 60_000,
+        maxPerWindow: 1,
+      });
+      const check = (key: string) => (srv as any).checkRateLimit(key);
+
+      expect(check('ip1:path')).toBe(true);
+      expect(check('ip1:path')).toBe(false); // blocked
+      expect(check('ip2:path')).toBe(true);  // different key → ok
+    });
+  });
 });

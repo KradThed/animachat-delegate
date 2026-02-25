@@ -166,26 +166,27 @@ export async function interactiveMcpAdd(configPathOverride?: string): Promise<bo
     if (Object.keys(env).length === 0) env = undefined;
   }
 
-  // Read config, check for duplicate, add server
-  try {
-    const { data: config } = readConfigRaw(configPathOverride);
-    if (!config.mcp_servers) config.mcp_servers = [];
-
-    const existing = config.mcp_servers.find((s: any) => s.name === name);
-    if (existing) {
-      console.error(`MCP server "${name}" already exists. Remove it first or choose another name.`);
-      return false;
-    }
-  } catch {
-    // Config doesn't exist yet — that's fine, updateConfig will handle it
-  }
-
+  // BUG-11 fix: duplicate check moved inside updateConfig callback (runs under lock).
+  // Previous code checked outside the lock, creating a TOCTOU race where two
+  // concurrent `mcp add` calls could both pass the duplicate check.
+  let duplicate = false;
   updateConfig(configPathOverride, (config) => {
     if (!config.mcp_servers) config.mcp_servers = [];
+
+    if (config.mcp_servers.find((s: any) => s.name === name)) {
+      duplicate = true;
+      return; // don't modify — updateConfig writes back as-is
+    }
+
     const entry: any = { name, command, args };
     if (env) entry.env = env;
     config.mcp_servers.push(entry);
   });
+
+  if (duplicate) {
+    console.error(`MCP server "${name}" already exists. Remove it first or choose another name.`);
+    return false;
+  }
 
   console.log(`Added MCP server "${name}".`);
   return true;

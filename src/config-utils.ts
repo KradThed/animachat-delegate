@@ -77,8 +77,10 @@ export function withLock<T>(configPath: string, fn: () => T): T {
     }
 
     try {
-      // Write pid:timestamp to lock file
-      writeFileSync(lockPath, `${process.pid}:${Date.now()}`, 'utf-8');
+      // BUG-2 fix: write through fd (not path) to avoid EBUSY on Windows.
+      // openSync('wx') returns fd that still holds the file open — writing via
+      // path would re-open, causing EBUSY since fd hasn't been closed yet.
+      writeFileSync(fd, `${process.pid}:${Date.now()}`, 'utf-8');
       return fn();
     } finally {
       if (fd !== null) try { closeSync(fd); } catch {}

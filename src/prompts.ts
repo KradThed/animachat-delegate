@@ -15,12 +15,21 @@ export async function promptText(question: string, defaultVal?: string): Promise
 
   return new Promise<string | null>((resolve) => {
     let answered = false;
-    const done = (val: string | null) => { if (!answered) { answered = true; rl.close(); resolve(val); } };
+    // BUG-7 fix: separate resolve guard from rl.close() to avoid recursive close.
+    // rl.close() emits 'close' event synchronously — calling rl.close() inside done()
+    // which is called from 'close' handler would recurse. Instead, only call rl.close()
+    // from non-close paths; the 'close' handler just resolves.
+    const settle = (val: string | null) => {
+      if (answered) return;
+      answered = true;
+      resolve(val);
+    };
 
-    rl.on('SIGINT', () => done(null));
-    rl.on('close', () => done(null));
+    rl.on('SIGINT', () => { settle(null); rl.close(); });
+    rl.on('close', () => settle(null));
     rl.question(`${question}${suffix}: `, (answer) => {
-      done(answer.trim() || defaultVal || '');
+      settle(answer.trim() || defaultVal || '');
+      rl.close();
     });
   });
 }

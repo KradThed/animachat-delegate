@@ -31,6 +31,7 @@ vi.mock('ws', async () => {
     send = vi.fn();
     close = vi.fn();
     terminate = vi.fn();
+    ping = vi.fn(); // DEL-4: WS-level ping support
 
     constructor(url: string) {
       super();
@@ -437,11 +438,11 @@ describe('DelegateConnection', () => {
       conn.sendToolManifest(tools);
 
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
-      expect(sent).toEqual({
-        type: 'tool_manifest',
-        delegateId: 'my-del',
-        tools,
-      });
+      expect(sent.type).toBe('tool_manifest');
+      expect(sent.delegateId).toBe('my-del');
+      expect(sent.tools).toEqual(tools);
+      expect(sent.timestamp).toBeDefined(); // Feature 4: timestamp for toolset history
+      expect(sent).not.toHaveProperty('warnings');
     });
 
     it('includes warnings when provided', async () => {
@@ -470,6 +471,55 @@ describe('DelegateConnection', () => {
 
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
       expect(sent).not.toHaveProperty('warnings');
+    });
+
+    it('includes ISO timestamp in manifest (Feature 4)', async () => {
+      const conn = new DelegateConnection(defaultOptions());
+      await connectAndAuth(conn);
+      mockWsInstance.send.mockClear();
+
+      conn.sendToolManifest([]);
+
+      const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
+      expect(sent.timestamp).toBeDefined();
+      // Verify it's a valid ISO date string
+      expect(new Date(sent.timestamp).toISOString()).toBe(sent.timestamp);
+    });
+
+    it('includes reason when provided (Feature 4)', async () => {
+      const conn = new DelegateConnection(defaultOptions());
+      await connectAndAuth(conn);
+      mockWsInstance.send.mockClear();
+
+      conn.sendToolManifest([], undefined, 'server_enabled:echo');
+
+      const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
+      expect(sent.reason).toBe('server_enabled:echo');
+    });
+
+    it('does not include reason key when reason is omitted', async () => {
+      const conn = new DelegateConnection(defaultOptions());
+      await connectAndAuth(conn);
+      mockWsInstance.send.mockClear();
+
+      conn.sendToolManifest([]);
+
+      const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
+      expect(sent).not.toHaveProperty('reason');
+    });
+
+    it('includes both reason and warnings when provided', async () => {
+      const conn = new DelegateConnection(defaultOptions());
+      await connectAndAuth(conn);
+      mockWsInstance.send.mockClear();
+
+      const warnings = [{ toolName: 'x', fromServer: 'a', conflictsWith: 'b' }];
+      conn.sendToolManifest([], warnings, 'config_reload');
+
+      const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
+      expect(sent.reason).toBe('config_reload');
+      expect(sent.warnings).toEqual(warnings);
+      expect(sent.timestamp).toBeDefined();
     });
   });
 
@@ -782,14 +832,17 @@ describe('DelegateConnection', () => {
       // Should still be authenticating (waiting for mcpl/ack)
       expect(conn.currentState).toBe('authenticating');
 
-      // Now send mcpl/ack
+      // Now send mcpl/ack as JSON-RPC 2.0 response (server encodes via McplCodec)
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({
-          type: 'mcpl/ack',
-          sessionId: 'mcpl-sess-1',
-          negotiatedCapabilities: ['context_hooks'],
-          featureSets: { server1: { contextHooks: true, pushEvents: false, inferenceRequests: false, toolManagement: false } },
+          jsonrpc: '2.0',
+          id: hello.requestId,
+          result: {
+            sessionId: 'mcpl-sess-1',
+            negotiatedCapabilities: ['context_hooks'],
+            featureSets: { server1: { contextHooks: true, pushEvents: false, inferenceRequests: false, toolManagement: false } },
+          },
         })),
       );
 
@@ -820,13 +873,18 @@ describe('DelegateConnection', () => {
           userId: 'u1',
         })),
       );
+      // Capture hello requestId for JSON-RPC correlation
+      const hello = JSON.parse(mockWsInstance.send.mock.calls[mockWsInstance.send.mock.calls.length - 1][0]);
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({
-          type: 'mcpl/ack',
-          sessionId: 'mcpl-sess-1',
-          negotiatedCapabilities: ['context_hooks'],
-          featureSets: {},
+          jsonrpc: '2.0',
+          id: hello.requestId,
+          result: {
+            sessionId: 'mcpl-sess-1',
+            negotiatedCapabilities: ['context_hooks'],
+            featureSets: {},
+          },
         })),
       );
 
@@ -857,13 +915,18 @@ describe('DelegateConnection', () => {
           userId: 'u1',
         })),
       );
+      // Capture hello requestId for JSON-RPC correlation
+      const hello3 = JSON.parse(mockWsInstance.send.mock.calls[mockWsInstance.send.mock.calls.length - 1][0]);
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({
-          type: 'mcpl/ack',
-          sessionId: 'mcpl-sess-new',
-          negotiatedCapabilities: [],
-          featureSets: {},
+          jsonrpc: '2.0',
+          id: hello3.requestId,
+          result: {
+            sessionId: 'mcpl-sess-new',
+            negotiatedCapabilities: [],
+            featureSets: {},
+          },
         })),
       );
 
@@ -1347,9 +1410,11 @@ describe('DelegateConnection', () => {
       const conn = new DelegateConnection(defaultOptions());
       await connectAndAuth(conn);
 
-      (conn as any).rcBuffer.set(1, { seq: 1, ack: 0, payload: { type: 'mcpl/a' } });
-      (conn as any).rcBuffer.set(2, { seq: 2, ack: 0, payload: { type: 'mcpl/b' } });
-      (conn as any).rcBuffer.set(3, { seq: 3, ack: 0, payload: { type: 'mcpl/c' } });
+      // DEL-1: rcBuffer stores { frame, ts } — not bare frame objects
+      const now = Date.now();
+      (conn as any).rcBuffer.set(1, { frame: { seq: 1, ack: 0, payload: { type: 'mcpl/a' } }, ts: now });
+      (conn as any).rcBuffer.set(2, { frame: { seq: 2, ack: 0, payload: { type: 'mcpl/b' } }, ts: now });
+      (conn as any).rcBuffer.set(3, { frame: { seq: 3, ack: 0, payload: { type: 'mcpl/c' } }, ts: now });
 
       mockWsInstance.send.mockClear();
       (conn as any).resendBufferedAfter(1);
@@ -1365,8 +1430,10 @@ describe('DelegateConnection', () => {
       const conn = new DelegateConnection(defaultOptions());
       await connectAndAuth(conn);
 
-      (conn as any).rcBuffer.set(1, { seq: 1, ack: 0, payload: { type: 'mcpl/a' } });
-      (conn as any).rcBuffer.set(2, { seq: 2, ack: 0, payload: { type: 'mcpl/b' } });
+      // DEL-1: rcBuffer stores { frame, ts }
+      const now = Date.now();
+      (conn as any).rcBuffer.set(1, { frame: { seq: 1, ack: 0, payload: { type: 'mcpl/a' } }, ts: now });
+      (conn as any).rcBuffer.set(2, { frame: { seq: 2, ack: 0, payload: { type: 'mcpl/b' } }, ts: now });
 
       mockWsInstance.send.mockClear();
       (conn as any).resendBufferedAfter(2);
@@ -1510,8 +1577,12 @@ describe('DelegateConnection', () => {
       await connectAndAuth(conn);
       mockWsInstance.send.mockClear();
 
+      // DEL-4: pongReceived starts as true (set in startHeartbeat),
+      // so first tick will send ws.ping() + app-level ping
       vi.advanceTimersByTime(5000);
 
+      // DEL-4: ws.ping() is called first (WS-level), then send() for app-level ping
+      expect(mockWsInstance.ping).toHaveBeenCalled();
       expect(mockWsInstance.send).toHaveBeenCalled();
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
       expect(sent.type).toBe('ping');

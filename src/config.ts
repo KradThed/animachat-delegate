@@ -17,7 +17,8 @@ function resolveEnvVars(value: unknown, missingVars?: string[]): unknown {
       if (!(varName in process.env)) {
         missingVars?.push(varName);
       }
-      return process.env[varName] || '';
+      // BUG-3 fix: ?? preserves empty string env values (|| would coerce '' to fallback)
+      return process.env[varName] ?? '';
     });
   }
   if (Array.isArray(value)) {

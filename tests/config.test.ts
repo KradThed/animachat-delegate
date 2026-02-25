@@ -92,6 +92,7 @@ delegate:
       enabled: false,
       port: 8080,
       endpoints: [],
+      rateLimits: { windowMs: 60_000, maxPerWindow: 60 },
     });
   });
 

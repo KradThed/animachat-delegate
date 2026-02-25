@@ -584,6 +584,7 @@ describe('DelegateConfigSchema', () => {
         enabled: false,
         port: 8080,
         endpoints: [],
+        rateLimits: { windowMs: 60_000, maxPerWindow: 60 },
       });
     }
   });
@@ -668,6 +669,55 @@ describe('DelegateConfigSchema', () => {
       expect(result.data.webhooks.enabled).toBe(false);
       expect(result.data.webhooks.port).toBe(8080);
       expect(result.data.webhooks.endpoints).toHaveLength(1);
+    }
+  });
+
+  it('defaults webhooks.rateLimits when omitted', () => {
+    const result = DelegateConfigSchema.safeParse(minimalConfig);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.webhooks.rateLimits).toEqual({
+        windowMs: 60_000,
+        maxPerWindow: 60,
+      });
+    }
+  });
+
+  it('accepts custom webhooks.rateLimits', () => {
+    const input = {
+      ...minimalConfig,
+      webhooks: {
+        enabled: true,
+        port: 9090,
+        endpoints: [],
+        rateLimits: {
+          windowMs: 10_000,
+          maxPerWindow: 5,
+        },
+      },
+    };
+    const result = DelegateConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.webhooks.rateLimits.windowMs).toBe(10_000);
+      expect(result.data.webhooks.rateLimits.maxPerWindow).toBe(5);
+    }
+  });
+
+  it('defaults individual rateLimits fields when partially provided', () => {
+    const input = {
+      ...minimalConfig,
+      webhooks: {
+        rateLimits: {
+          maxPerWindow: 10,
+        },
+      },
+    };
+    const result = DelegateConfigSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.webhooks.rateLimits.windowMs).toBe(60_000); // default
+      expect(result.data.webhooks.rateLimits.maxPerWindow).toBe(10);  // custom
     }
   });
 
