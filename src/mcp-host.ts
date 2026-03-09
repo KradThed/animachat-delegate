@@ -14,6 +14,21 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { McpServerConfig, ToolDefinition } from './types.js';
 
 // =============================================================================
+// Helpers
+// =============================================================================
+
+/** Race a promise against a timeout. Rejects with TimeoutError on expiry. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout: ${label} exceeded ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -296,7 +311,11 @@ export class McpHostManager {
     }
 
     try {
-      const result = await server.client.callTool({ name, arguments: args });
+      const result = await withTimeout(
+        server.client.callTool({ name, arguments: args }),
+        300_000,
+        `callTool(${name})`
+      );
 
       // Extract text content from the result
       const textParts: string[] = [];
@@ -521,7 +540,7 @@ export class McpHostManager {
     );
 
     const transport = new SSEClientTransport(parsedUrl);
-    await client.connect(transport);
+    await withTimeout(client.connect(transport), 30_000, `connect(SSE:${name})`);
 
     // DEL-14: Detect SSE server connection loss (must be after connect())
     client.onclose = () => {
@@ -569,7 +588,7 @@ export class McpHostManager {
       { capabilities: {} }
     );
 
-    await client.connect(transport);
+    await withTimeout(client.connect(transport), 30_000, `connect(stdio:${config.name})`);
 
     // DEL-12: Detect MCP server crash/exit (must be set AFTER connect() which replaces callbacks)
     const serverName = config.name;
@@ -604,7 +623,11 @@ export class McpHostManager {
     const allTools: ToolDefinition[] = [];
     let cursor: string | undefined;
     do {
-      const result = await server.client.listTools(cursor ? { cursor } : undefined);
+      const result = await withTimeout(
+        server.client.listTools(cursor ? { cursor } : undefined),
+        15_000,
+        `listTools(${server.name})`
+      );
       for (const tool of result.tools) {
         // D-10: Validate inputSchema — properties must be an object, required must be string[]
         const rawSchema = tool.inputSchema as any;

@@ -259,13 +259,8 @@ export class DelegateConnection extends EventEmitter {
       const { serverUrl, token, delegateId } = this.options;
       const separator = serverUrl.includes('?') ? '&' : '?';
 
-      // Support both JWT tokens and API keys (dak_xxx)
-      // API keys start with "dak_", JWT tokens don't
-      const isApiKey = token.startsWith('dak_');
-      const authParam = isApiKey
-        ? `apiKey=${encodeURIComponent(token)}`
-        : `token=${encodeURIComponent(token)}`;
-      const url = `${serverUrl}${separator}${authParam}&role=delegate&delegateId=${encodeURIComponent(delegateId)}`;
+      // Auth credentials sent as first message after open (not in URL to avoid proxy log leaks)
+      const url = `${serverUrl}${separator}role=delegate&delegateId=${encodeURIComponent(delegateId)}`;
 
       console.log(`[Connection] Connecting to ${DelegateConnection.redactUrl(url)} as delegate "${delegateId}"...`);
 
@@ -296,7 +291,14 @@ export class DelegateConnection extends EventEmitter {
 
       this.ws.on('open', () => {
         this.setState('authenticating');
-        console.log('[Connection] WebSocket opened, waiting for auth result...');
+        // Send auth credentials as first message (not in URL to avoid proxy log leaks)
+        const isApiKey = token.startsWith('dak_');
+        this.ws!.send(JSON.stringify({
+          type: 'delegate_auth',
+          ...(isApiKey ? { apiKey: token } : { token }),
+          delegateId,
+        }));
+        console.log('[Connection] WebSocket opened, sent auth, waiting for result...');
       });
 
       this.ws.on('message', (data) => {
@@ -363,7 +365,7 @@ export class DelegateConnection extends EventEmitter {
           if (msg.jsonrpc === '2.0' && 'result' in msg && !('seq' in msg)) {
             const ackPayload = msg.result as Record<string, unknown>;
             if (!trySettle()) return; // DEL-3
-            this.handleMcplAckAuth(ackPayload, resolve);
+            this.handleMcplAckAuth(ackPayload, resolve, reject);
             return;
           }
 
@@ -382,7 +384,7 @@ export class DelegateConnection extends EventEmitter {
             if (typeof ackPayload.resumedFromSeq === 'number') {
               this.resendBufferedAfter(ackPayload.resumedFromSeq);
             }
-            this.handleMcplAckAuth(ackPayload, resolve);
+            this.handleMcplAckAuth(ackPayload, resolve, reject);
             return;
           }
         }
@@ -447,7 +449,7 @@ export class DelegateConnection extends EventEmitter {
   /**
    * Handle mcpl/ack during auth phase (shared between plain and framed paths).
    */
-  private handleMcplAckAuth(ackMsg: any, resolve: () => void): void {
+  private handleMcplAckAuth(ackMsg: any, resolve: () => void, reject?: (err: Error) => void): void {
     this._isMcpl = true;
     this.mcplSessionId = ackMsg.sessionId;
     this._featureSets = ackMsg.featureSets || {};
@@ -477,8 +479,10 @@ export class DelegateConnection extends EventEmitter {
     // Should never be null here, but if auth_result had missing fields, non-null assertion
     // would mask the problem. Defensive check + clear error is safer.
     if (!this.sessionId || !this.userId) {
-      console.error('[Connection] MCPL ack received but sessionId or userId is null — auth_result was incomplete');
+      const err = new Error('MCPL ack received but sessionId or userId is null — auth_result was incomplete');
+      console.error(`[Connection] ${err.message}`);
       this.ws?.close(4500, 'incomplete_auth');
+      if (reject) reject(err);
       return;
     }
     this.emit('connected', this.sessionId, this.userId);

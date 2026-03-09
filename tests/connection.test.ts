@@ -597,7 +597,7 @@ describe('DelegateConnection', () => {
   // =========================================================================
 
   describe('URL construction via doConnect', () => {
-    it('uses token= param for JWT tokens', async () => {
+    it('sends token in first message for JWT tokens (not in URL)', async () => {
       const conn = new DelegateConnection(
         defaultOptions({ serverUrl: 'wss://example.com/ws', token: 'jwt-abc123' }),
       );
@@ -605,11 +605,19 @@ describe('DelegateConnection', () => {
       const connectPromise = conn.connect();
       await vi.waitFor(() => expect(mockWsInstance).toBeTruthy());
 
-      expect(mockWsInstance.url).toContain('token=jwt-abc123');
+      // Auth credentials should NOT be in URL
+      expect(mockWsInstance.url).not.toContain('token=jwt');
       expect(mockWsInstance.url).not.toContain('apiKey=');
+      expect(mockWsInstance.url).toContain('role=delegate');
 
       // Clean up: simulate open + auth to resolve the promise
       mockWsInstance.emit('open');
+
+      // First message should be delegate_auth with token
+      expect(mockWsInstance.send).toHaveBeenCalledWith(
+        JSON.stringify({ type: 'delegate_auth', token: 'jwt-abc123', delegateId: 'test-delegate' }),
+      );
+
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({ type: 'delegate_auth_result', success: true, sessionId: 's', userId: 'u' })),
@@ -617,7 +625,7 @@ describe('DelegateConnection', () => {
       await connectPromise;
     });
 
-    it('uses apiKey= param for dak_ tokens', async () => {
+    it('sends apiKey in first message for dak_ tokens (not in URL)', async () => {
       const conn = new DelegateConnection(
         defaultOptions({ serverUrl: 'wss://example.com/ws', token: 'dak_abc123' }),
       );
@@ -625,10 +633,17 @@ describe('DelegateConnection', () => {
       const connectPromise = conn.connect();
       await vi.waitFor(() => expect(mockWsInstance).toBeTruthy());
 
-      expect(mockWsInstance.url).toContain('apiKey=dak_abc123');
+      // Auth credentials should NOT be in URL
+      expect(mockWsInstance.url).not.toContain('apiKey=');
       expect(mockWsInstance.url).not.toContain('token=');
 
       mockWsInstance.emit('open');
+
+      // First message should be delegate_auth with apiKey
+      expect(mockWsInstance.send).toHaveBeenCalledWith(
+        JSON.stringify({ type: 'delegate_auth', apiKey: 'dak_abc123', delegateId: 'test-delegate' }),
+      );
+
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({ type: 'delegate_auth_result', success: true, sessionId: 's', userId: 'u' })),
@@ -663,8 +678,9 @@ describe('DelegateConnection', () => {
       const connectPromise = conn.connect();
       await vi.waitFor(() => expect(mockWsInstance).toBeTruthy());
 
-      // Should have & after existing param, not ?
-      expect(mockWsInstance.url).toMatch(/\?existing=1&token=/);
+      // Should have & after existing param for role/delegateId (no auth in URL)
+      expect(mockWsInstance.url).toMatch(/\?existing=1&role=delegate/);
+      expect(mockWsInstance.url).not.toContain('token=');
 
       mockWsInstance.emit('open');
       mockWsInstance.emit(
