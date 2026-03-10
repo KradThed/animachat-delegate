@@ -59,6 +59,7 @@ const program = new Command()
   .name('animachat-delegate')
   .description('Animachat delegate - remote tool execution and MCP hosting')
   .version('1.0.0')
+  .enablePositionalOptions()  // BUG 1 fix: stop parent from absorbing subcommand options
   .option('-c, --config <path>', 'Path to config YAML file')
   .option('-s, --server <url>', 'Server WebSocket URL (overrides config)')
   .option('-t, --token <token>', 'Auth token (overrides config)')
@@ -71,6 +72,8 @@ const program = new Command()
 
 // Flag set by `init` (option 1: "Start delegate now") or default action
 let runMain = false;
+// BUG 2 fix: resolved config path from init → main() handoff
+let resolvedConfigPath: string | undefined;
 
 // =============================================================================
 // Login Flow (reusable by both `login` and `init` subcommands)
@@ -104,7 +107,7 @@ async function loginFlow(opts: LoginFlowOptions): Promise<LoginFlowResult> {
   const fsDeps = { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, YAML, resolve };
 
   // L5: validation regexes
-  const API_KEY_RE = /^dak_[A-Za-z0-9]{8,}$/;
+  const API_KEY_RE = /^dak_[A-Za-z0-9_-]{8,}$/;
   const NAMESPACE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
   // Non-interactive check
@@ -255,12 +258,20 @@ async function loginFlow(opts: LoginFlowOptions): Promise<LoginFlowResult> {
           return;
         }
 
+        // BUG 6 fix: validate code parameter exists
+        if (!code) {
+          safeEnd(res, 400, '<html><body><h2>Missing authorization code</h2></body></html>');
+          finalize({ success: false, error: 'Callback missing authorization code' });
+          return;
+        }
+
         // Success — show redirect page
+        const safeFrontend = frontendUrl.replace(/"/g, '&quot;').replace(/</g, '&lt;');  // BUG 11 fix: escape URL
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(`<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2;url=${frontendUrl}"></head><body><h2>✓ Authorized</h2><p>Redirecting to AnimaChat...</p></body></html>`);
+        res.end(`<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2;url=${safeFrontend}"></head><body><h2>✓ Authorized</h2><p>Redirecting to AnimaChat...</p></body></html>`);
 
         // Exchange code for API key (async, don't block response)
-        exchangeCode(code!);
+        exchangeCode(code);
       } finally {
         safeEnd(res);  // B) always end response — don't leave browser socket hanging
       }
@@ -274,7 +285,7 @@ async function loginFlow(opts: LoginFlowOptions): Promise<LoginFlowResult> {
         const response = await fetch(exchangeUrl.toString(), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code, code_verifier: codeVerifier }),
+          body: JSON.stringify({ code, code_verifier: codeVerifier, redirect_uri: redirectUri, state }),  // BUG 14+15 fix: RFC 6749 compliance
           signal: abortController.signal,
         });
 
@@ -386,7 +397,7 @@ function writeConfigYaml(
       config.server.url = serverUrl;
       config.server.token = apiKey;
       if (!config.delegate) config.delegate = {};
-      config.delegate.id = namespace;
+      if (!config.delegate.id) config.delegate.id = namespace;  // BUG 3 fix: preserve existing delegate.id
       if (!config.delegate.capabilities) config.delegate.capabilities = ['mcp_host'];
     } else {
       // Create new config
@@ -458,6 +469,7 @@ program
       if (choice === 0) {
         // Start delegate — set runMain and let it fall through
         console.log('\nStarting delegate...\n');
+        resolvedConfigPath = configPath;  // BUG 2 fix: pass config path to main()
         runMain = true;
         return;
       }
@@ -537,6 +549,7 @@ program
     const startNow = await promptConfirm('Start the delegate now?');
     if (startNow) {
       console.log('\nStarting delegate...\n');
+      resolvedConfigPath = configPath;  // BUG 2 fix: pass config path to main()
       runMain = true;
       return;
     }
@@ -688,8 +701,8 @@ async function main(): Promise<void> {
   const { TelemetryBus } = await import('./telemetry.js');
   const { DEFAULTS } = await import('./constants.js');
 
-  // Load config
-  const configPath = findConfigPath(opts.config);
+  // Load config — BUG 2 fix: prefer resolvedConfigPath from init "Start now"
+  const configPath = findConfigPath(resolvedConfigPath || opts.config);
   let config = loadConfig(configPath);
 
   // Fix #3: Ensure all MCP servers have persistent IDs (auto-generate if missing)
