@@ -58,7 +58,8 @@ export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcRespo
  * and wrap it as { jsonrpc, id, result } instead of { jsonrpc, method, params }.
  */
 export const RESPONSE_TYPE_MAP: Record<string, string> = {
-  'mcpl/ack':                      'mcpl/hello',
+  // H5: mcpl/ack maps to 'initialize' — hello/ack bypass codec (sent raw), kept for response type detection
+  'mcpl/ack':                      'initialize',
   'mcpl/beforeInference_response': 'mcpl/beforeInference',
   // afterInference has two response types (ack = MVP, response = full with modifiedResponse).
   // Both map to the same request. REQUEST_TO_RESPONSE_TYPE takes first match (afterInference_response).
@@ -75,6 +76,7 @@ export const RESPONSE_TYPE_MAP: Record<string, string> = {
   'mcpl/state_response':           'mcpl/state_get',
   'mcpl/checkpoint_list_response': 'mcpl/checkpoint_list',
   'mcpl/model_info_response':      'mcpl/model_info_request',
+  'mcpl/push_event_response':      'mcpl/push_event',  // F8c fix: push_event is a request, not notification
   // NOTE: connect_server_result is NOT here — it's a notification (no correlated request id).
   // connect_server is also a notification. The requestId in connect_server_result
   // refers to the original scope_change_request, not to connect_server.
@@ -102,12 +104,78 @@ REQUEST_TO_RESPONSE_TYPE['mcpl/state_rollback'] = 'mcpl/state_response';
  * On the wire: JSON-RPC notification (no `id` field).
  */
 export const NOTIFICATION_TYPES = new Set([
-  'mcpl/push_event',
+  // F8c fix: push_event removed — it's a request (expects push_event_response), not a notification
   'mcpl/featureSets_changed',
+  'mcpl/featureSets_update',    // F16: server→delegate capability change notification
   'mcpl/inference_chunk',
   'mcpl/connect_server',
   'mcpl/connect_server_result',  // BUG 1 fix: result is also notification (requestId = scope_change's, not connect_server's)
 ]);
+
+// =============================================================================
+// F1 fix: Wire Method Name Translation (MCPL Spec v0.4.1-draft)
+//
+// Internal names (mcpl/...) stay unchanged in application code.
+// Only the codec translates on encode/decode.
+// =============================================================================
+
+/**
+ * Maps internal method names → spec wire names.
+ * Requests and notifications:
+ */
+export const INTERNAL_TO_WIRE: Record<string, string> = {
+  // Context hooks (Section 10)
+  'mcpl/beforeInference':        'context/beforeInference',
+  'mcpl/afterInference':         'context/afterInference',
+  // Push events (Section 9)
+  'mcpl/push_event':             'push/event',
+  // Inference (Section 11)
+  'mcpl/inference_request':      'inference/request',
+  'mcpl/inference_chunk':        'inference/chunk',
+  // State management (Section 8)
+  'mcpl/state_set':              'state/set',
+  'mcpl/state_patch':            'state/patch',
+  'mcpl/state_get':              'state/get',
+  'mcpl/state_rollback':         'state/rollback',
+  'mcpl/checkpoint_list':        'state/checkpoints',
+  // Feature sets (Section 6)
+  'mcpl/featureSets_changed':    'featureSets/changed',
+  'mcpl/featureSets_update':     'featureSets/update',
+  // Scoped access (Section 7) — B5 fix: scopedAccess/* → scope/*
+  'mcpl/scope_change_request':   'scope/request',
+  'mcpl/scope_elevate_request':  'scope/elevate',
+  // Model info (Section 12)
+  'mcpl/model_info_request':     'model/info',
+  // Connection
+  // H5: initialize is sent raw (not through codec), but keep mapping for completeness
+  'mcpl/hello':                  'initialize',
+  'mcpl/connect_server':         'mcpl/connectServer',
+  'mcpl/connect_server_result':  'mcpl/connectServerResult',
+
+  // Responses — also translated on wire
+  // H5: ack is initializeResult on wire (sent via codec as JSON-RPC response)
+  'mcpl/ack':                      'initializeResult',
+  'mcpl/beforeInference_response': 'context/beforeInferenceResult',
+  'mcpl/afterInference_response':  'context/afterInferenceResult',
+  'mcpl/afterInference_ack':       'context/afterInferenceAck',
+  'mcpl/inference_response':       'inference/response',
+  'mcpl/scope_change_result':      'scope/result',
+  'mcpl/scope_elevate_result':     'scope/elevateResult',
+  'mcpl/state_set_result':         'state/setResult',
+  'mcpl/state_patch_result':       'state/patchResult',
+  'mcpl/state_response':           'state/response',
+  'mcpl/checkpoint_list_response': 'state/checkpointsResult',
+  'mcpl/model_info_response':      'model/infoResult',
+  'mcpl/push_event_response':      'push/eventResult',  // F8c fix
+  'mcpl/error':                    'mcpl/error',
+};
+
+/**
+ * Reverse map: spec wire name → internal name.
+ * Built at module load from INTERNAL_TO_WIRE.
+ */
+export const WIRE_TO_INTERNAL: Record<string, string> =
+  Object.fromEntries(Object.entries(INTERNAL_TO_WIRE).map(([k, v]) => [v, k]));
 
 // =============================================================================
 // Standard JSON-RPC 2.0 Error Codes
@@ -119,6 +187,16 @@ export const JSONRPC_ERRORS = {
   METHOD_NOT_FOUND: -32601,
   INVALID_PARAMS:   -32602,
   INTERNAL_ERROR:   -32603,
+} as const;
+
+// MCPL Spec Appendix A Error Codes
+export const MCPL_ERROR_CODES = {
+  FEATURE_SET_NOT_ENABLED:  -32001,  // Message used a disabled feature set
+  UNKNOWN_FEATURE_SET:      -32003,  // Message used undeclared feature set
+  CHECKPOINT_NOT_FOUND:     -32005,  // Rollback targeted a pruned or unknown checkpoint
+  CHANNEL_NOT_PERMITTED:    -32017,  // Lacking scope to publish or observe channel
+  UNKNOWN_CHANNEL:          -32023,  // Channel id doesn't exist or not registered
+  CHANNEL_OPEN_FAILED:      -32024,  // Server could not open/connect the requested channel
 } as const;
 
 // =============================================================================

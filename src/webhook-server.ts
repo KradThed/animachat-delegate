@@ -100,10 +100,16 @@ export class WebhookServer {
       // Signature verification — DEL-6: use raw body for HMAC
       if (endpoint.secret) {
         const rawBody: Buffer | undefined = (req as any).rawBody;
+        // B11: reject if rawBody missing — re-serialization won't match signature bytes
+        if (!rawBody) {
+          console.warn(`[Webhooks] No raw body available for HMAC verification (${endpoint.source})`);
+          res.status(500).json({ error: 'Raw body not captured for signature verification' });
+          return;
+        }
         const valid = this.verifySignature(
           endpoint.source,
           endpoint.secret,
-          rawBody || Buffer.from(JSON.stringify(req.body)),
+          rawBody,
           req.headers as Record<string, string>
         );
         if (!valid) {
@@ -142,18 +148,28 @@ export class WebhookServer {
         const deliveryId = this.extractDeliveryId(endpoint.source, headers);
         const eventType = this.extractEventType(endpoint.source, headers);
 
-        this.connection.sendPushEvent({
-          id: eventId,
-          source: `${endpoint.source}_webhook`,
+        // E1: Check if push event was accepted by connection (featureSet enforcement)
+        const sent = this.connection.sendPushEvent({
+          eventId,
+          featureSet: `${endpoint.source}_webhook`,  // F8a: source → featureSet
+          origin: { server: endpoint.source },        // spec: provenance metadata object
           conversationId: endpoint.conversation_id,
           eventType,
-          payload: parsed.context,
+          // B8: spec Section 9.2 requires payload: { content: ContentBlock[] }
+          payload: {
+            content: [{ type: 'text' as const, text: JSON.stringify(parsed.context) }],
+          },
           systemMessage: parsed.systemMessage,
           idempotencyKey: deliveryId || eventId,
         });
 
-        console.log(`[Webhooks] Forwarded ${endpoint.source} event as MCPL push ${eventId} (idempotencyKey: ${deliveryId || 'auto'})`);
-        res.json({ accepted: true, eventId, mode: 'mcpl' });
+        if (sent) {
+          console.log(`[Webhooks] Forwarded ${endpoint.source} event as MCPL push ${eventId} (idempotencyKey: ${deliveryId || 'auto'})`);
+          res.json({ accepted: true, eventId, mode: 'mcpl' });
+        } else {
+          console.warn(`[Webhooks] Push event rejected by featureSet enforcement: ${eventId}`);
+          res.status(503).json({ accepted: false, eventId, error: 'Feature set not enabled' });
+        }
       } else {
         // Legacy mode: use trigger_inference
         this.connection.sendTriggerInference({
@@ -406,8 +422,11 @@ export class WebhookServer {
         return timingSafeEqual(expectedBuf, signatureBuf);
       }
 
-      // For unknown sources, skip verification
-      return true;
+      // S-4 fix: Unknown sources MUST NOT bypass signature verification.
+      // A configured secret implies the user wants webhook auth — silently
+      // skipping it would let anyone send unauthenticated payloads.
+      console.warn(`[Webhooks] No signature verifier for source "${source}". Rejecting request. Configure source as "gitlab" or "github", or remove the secret.`);
+      return false;
     } catch (error) {
       console.error(`[Webhooks] Signature verification error:`, error);
       return false;

@@ -124,13 +124,15 @@ export function updateConfig(configPath: string | undefined, fn: (config: any) =
 }
 
 /**
- * Mask API key for display: first 8 chars + '...' + last 4 chars.
+ * Mask API key for display: first 4 chars + '...' + last 4 chars.
+ * B10: reduced from 8+4 to 4+4 to avoid revealing too much of the key.
  */
 export function maskApiKey(token: string | undefined): string {
   if (!token) return '(not set)';
   if (token.length > 12) {
-    return token.substring(0, 8) + '...' + token.substring(token.length - 4);
+    return token.substring(0, 4) + '...' + token.substring(token.length - 4);
   }
+  // Short tokens: mask entirely to avoid leaking most of the key
   return '***';
 }
 

@@ -35,19 +35,29 @@ import type { ToolCallRequest } from './types.js';
  * @param inferenceContext - Chain/frame IDs (undefined if not in an inference chain)
  * @param acceptsMcplContext - Whether the target MCP server opted in via config
  */
+// H7: mcplState param updated — state/checkpoint now at top level per spec §8.4
 export function maybeInjectMcpl(
   toolInput: Record<string, unknown>,
   inferenceContext: { chainId: string; frameId: string } | undefined,
+  mcplState: { state: Record<string, unknown> | null; checkpoint?: string; stateVersion?: number } | undefined,
   acceptsMcplContext: boolean,
 ): Record<string, unknown> {
-  if (!inferenceContext || !acceptsMcplContext) return toolInput;
+  if (!acceptsMcplContext) return toolInput;
+  if (!inferenceContext && !mcplState) return toolInput;
+
+  const mcplPayload: Record<string, unknown> = { v: 1 };
+  if (inferenceContext) {
+    mcplPayload.chainId = inferenceContext.chainId;
+    mcplPayload.frameId = inferenceContext.frameId;
+  }
+  if (mcplState) {
+    mcplPayload.state = mcplState.state;
+    if (mcplState.checkpoint) mcplPayload.checkpoint = mcplState.checkpoint;
+    if (mcplState.stateVersion !== undefined) mcplPayload.stateVersion = mcplState.stateVersion;
+  }
   return {
     ...toolInput,
-    _mcpl: {
-      v: 1,
-      chainId: inferenceContext.chainId,
-      frameId: inferenceContext.frameId,
-    },
+    _mcpl: mcplPayload,
   };
 }
 
@@ -707,7 +717,7 @@ async function main(): Promise<void> {
 
   // Fix #3: Ensure all MCP servers have persistent IDs (auto-generate if missing)
   const { ensureServerIds } = await import('./config-utils.js');
-  ensureServerIds(opts.config, config.delegate.id);
+  ensureServerIds(configPath, config.delegate.id);
 
   // CLI overrides
   if (opts.server) config.server.url = opts.server;
@@ -752,14 +762,23 @@ async function main(): Promise<void> {
   const bus = new TelemetryBus();
 
   // DEL-12: Wire MCP server crash detection to telemetry
+  // M3 fix: wrap in try/catch to prevent cascade crash
   mcpHost.onServerDied = (name) => {
-    bus.pushError(`MCP server "${name}" crashed`, name);
-    handleToolsetChange('server_crashed', name);
+    try {
+      bus.pushError(`MCP server "${name}" crashed`, name);
+      handleToolsetChange('server_crashed', name);
+    } catch (err) {
+      console.error(`[Main] Error handling server crash for "${name}":`, err);
+    }
   };
 
   // Feature 3: Notify server when toolset changes (enable/disable/restart/crash)
   mcpHost.onToolsetChanged = (reason, serverName) => {
-    handleToolsetChange(reason, serverName);
+    try {
+      handleToolsetChange(reason, serverName);
+    } catch (err) {
+      console.error(`[Main] Error handling toolset change (${reason}, ${serverName}):`, err);
+    }
   };
 
   function handleToolsetChange(reason: string, serverName: string): void {
@@ -774,8 +793,9 @@ async function main(): Promise<void> {
       // Feature 3+4: Send push event with toolset change context
       if (connection.isMcpl) {
         connection.sendPushEvent({
-          id: randomUUID(),
-          source: 'delegate',
+          eventId: randomUUID(),
+          featureSet: 'delegate',      // F8a: source → featureSet
+          origin: { server: 'delegate' },  // spec: provenance metadata object
           conversationId: '',  // broadcast — not conversation-specific
           eventType: 'toolset_changed',
           payload: {
@@ -807,6 +827,18 @@ async function main(): Promise<void> {
     token: config.server.token,
     delegateId: config.delegate.id,
     capabilities: config.delegate.capabilities,
+    mcplCapabilities: {              // H4 fix: spec §5.1 nested capabilities
+      version: '0.4',
+      pushEvents: true,
+      contextHooks: {
+        beforeInference: true,
+        afterInference: { blocking: true },
+      },
+      inferenceRequest: { streaming: false },  // B2: chunks not forwarded yet, don't advertise
+      modelInfo: true,
+      featureSets: true,
+      toolManagement: true,
+    },
   });
 
   // Send tool manifest on connect (and reconnect)
@@ -821,6 +853,17 @@ async function main(): Promise<void> {
       bus.setSetupStep('manifest', 'ok', `${currentTools.length} tools`);
     } else {
       bus.setSetupStep('manifest', 'error', 'No tools to advertise');
+    }
+
+    // §5.3+§6.1: Send initial featureSets to backend so it knows what servers exist
+    if (connection.isMcpl) {
+      const featureSets = mcpHost.buildFeatureSets();
+      const names = Object.keys(featureSets);
+      // П3: Pre-populate before sendFeatureSetsChanged to close race window
+      if (names.length > 0) {
+        connection.prePopulateFeatureSets(names);
+        connection.sendFeatureSetsChanged({ added: featureSets });
+      }
     }
 
     // Schedule tick slowdown after 5min stable connected
@@ -859,12 +902,22 @@ async function main(): Promise<void> {
           console.debug('[MCPL] mcpl_context_not_injected_missing_server_config',
             { server: serverName, tool: request.tool.name, requestId: request.requestId.slice(0, 8) });
         }
-        toolInput = maybeInjectMcpl(toolInput, request.inferenceContext, serverConfig?.acceptsMcplContext ?? false);
+        // H7: state/checkpoint now at request top level per spec §8.4
+        const mcplStateForInject = request.state !== undefined ? {
+          state: request.state,
+          checkpoint: request.checkpoint,
+          stateVersion: request.stateVersion,
+        } : undefined;
+        toolInput = maybeInjectMcpl(toolInput, request.inferenceContext, mcplStateForInject, serverConfig?.acceptsMcplContext ?? false);
       }
     }
 
     try {
-      const result = await mcpHost.callTool(request.tool.name, toolInput);
+      const result = await mcpHost.callTool(request.tool.name, toolInput, {
+        // H7: forward MCPL state/checkpoint per spec §8.4
+        state: request.state ?? undefined,
+        checkpoint: request.checkpoint,
+      });
       // emitToolEnd AFTER confirmed send
       try {
         connection.sendToolCallResponse(
@@ -893,6 +946,84 @@ async function main(): Promise<void> {
     }
   });
 
+  // ==========================================================================
+  // Dynamic Server Addition: mcpl/connect_server
+  //
+  // Backend instructs delegate to connect a new MCP server at runtime (SSE).
+  // Uses mcpHost.addServer() → sends connect_server_result → updates manifest
+  // + featureSets.
+  // ==========================================================================
+
+  connection.on('mcpl_connect_server', async (msg: any) => {
+    const url: string = msg.url;
+    const serverName: string | undefined = msg.serverName;
+    const requestId: string | undefined = msg.requestId;
+
+    if (!url) {
+      console.error('[Main] mcpl/connect_server missing url');
+      if (requestId) {
+        connection.sendConnectServerResult({
+          requestId,
+          url: '',
+          success: false,
+          error: 'Missing url in connect_server message',
+        });
+      }
+      return;
+    }
+
+    console.log(`[Main] Dynamic server addition: ${serverName || url}`);
+
+    try {
+      const { tools } = await mcpHost.addServer(url, serverName);
+      const name = serverName || new URL(url).hostname;
+
+      // Send success result back to backend
+      if (requestId) {
+        connection.sendConnectServerResult({
+          requestId,
+          url,
+          success: true,
+          serverId: name,
+          tools: tools.map(t => ({
+            name: t.name,
+            description: t.description || '',
+            inputSchema: t.inputSchema,
+          })),
+        });
+      }
+
+      // Update tool manifest (triggers handleToolsetChange flow)
+      handleToolsetChange('dynamic_server_added', name);
+
+      // Update featureSets so backend knows about the new server's capabilities
+      if (connection.isMcpl) {
+        const newFeatureSet = mcpHost.buildFeatureSets();
+        const added: Record<string, any> = {};
+        if (newFeatureSet[name]) {
+          added[name] = newFeatureSet[name];
+        }
+        if (Object.keys(added).length > 0) {
+          connection.sendFeatureSetsChanged({ added });
+        }
+      }
+
+      console.log(`[Main] Dynamic server "${name}" added successfully (${tools.length} tools)`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[Main] Dynamic server addition failed: ${errMsg}`);
+
+      if (requestId) {
+        connection.sendConnectServerResult({
+          requestId,
+          url,
+          success: false,
+          error: errMsg,
+        });
+      }
+    }
+  });
+
   connection.on('error', (error: Error) => {
     bus.pushError(error.message);
   });
@@ -914,14 +1045,19 @@ async function main(): Promise<void> {
 
       // D-3: Wrap send in try/catch — if WS is disconnected, resolve with denied
       try {
+        // Bug 3: Derive serverId from featureSet (featureSet name = server name in delegate)
+        const featureSet = String(input.featureSet || '');
         connection.sendScopeElevateRequest({
           requestId,
+          featureSet,
+          scope: {
+            label: String(input.label || ''),
+            ...(input.payload ? { payload: input.payload as Record<string, unknown> } : {}),
+          },
           delegateId: config.delegate.id,
-          serverId: '',
-          conversationId: '',
-          featureSet: String(input.featureSet || ''),
-          label: String(input.label || ''),
-          requestedCapabilities: (input.capabilities as string[]) || [],
+          serverId: featureSet,  // Bug 3: featureSet = server name in delegate architecture
+          conversationId: '',  // Bug 3: delegate doesn't own conversations; backend fills this
+          requestedCapabilities: [],  // Bug 4: schema has no 'capabilities' field — always empty
           reason: String(input.reason || ''),
         });
       } catch (err) {
@@ -940,7 +1076,7 @@ async function main(): Promise<void> {
       const handler = (msg: any) => {
         if (msg.requestId === requestId) {
           cleanup();
-          resolve({ approved: msg.approved, newCapabilities: msg.newCapabilities });
+          resolve({ approved: msg.approved, payload: msg.payload, reason: msg.reason });
         }
       };
 
@@ -958,6 +1094,468 @@ async function main(): Promise<void> {
       }, 65_000);
     });
   });
+
+  // ==========================================================================
+  // MCPL Proxy: Wire _mcpl_* virtual tools to backend via pendingRequests
+  //
+  // MCP servers call _mcpl_inference_request, _mcpl_state_get, etc.
+  // Delegate forwards to backend, waits for response, returns result.
+  // ==========================================================================
+
+  if (connection.isMcpl) {
+    mcpHost.setMcplProxyHandler(async (method: string, input: Record<string, unknown>) => {
+      const requestId = randomUUID();
+
+      switch (method) {
+        case '_mcpl_inference_request': {
+          // Bug 6: Reject stream:true — chunks not forwarded yet (B2: streaming: false in caps)
+          if (input.stream === true) {
+            throw new Error('Streaming inference not supported yet. Use stream: false.');
+          }
+          const pending = registerPendingRequest(requestId, 120_000); // inference can be slow
+          connection.sendInferenceRequest({
+            requestId,
+            featureSet: String(input.featureSet || ''),
+            conversationId: String(input.conversationId || ''),
+            stream: false,  // Bug 6: always non-streaming until chunk forwarding is implemented
+            messages: (input.messages as Array<{ role: 'user' | 'assistant'; content: string }>) || [],
+            preferences: {
+              ...(input.maxTokens ? { maxTokens: Number(input.maxTokens) } : {}),
+              ...(input.temperature != null ? { temperature: Number(input.temperature) } : {}),
+            },
+          });
+          return await pending;
+        }
+
+        case '_mcpl_state_get': {
+          const pending = registerPendingRequest(requestId, 30_000);
+          connection.sendStateGet(requestId, String(input.conversationId || ''));
+          return await pending;
+        }
+
+        case '_mcpl_state_patch': {
+          const pending = registerPendingRequest(requestId, 30_000);
+          connection.sendStatePatch(
+            requestId,
+            String(input.conversationId || ''),
+            (input.patch as unknown[]) || [],
+          );
+          return await pending;
+        }
+
+        case '_mcpl_state_rollback': {
+          const pending = registerPendingRequest(requestId, 30_000);
+          connection.sendStateRollback(
+            requestId,
+            String(input.featureSet || ''),
+            String(input.checkpoint || ''),
+          );
+          return await pending;
+        }
+
+        case '_mcpl_checkpoint_list': {
+          const pending = registerPendingRequest(requestId, 30_000);
+          connection.sendCheckpointList(requestId, String(input.conversationId || ''));
+          return await pending;
+        }
+
+        case '_mcpl_model_info': {
+          const pending = registerPendingRequest(requestId, 10_000);
+          connection.sendModelInfoRequest(requestId, input.conversationId ? String(input.conversationId) : undefined);
+          return await pending;
+        }
+
+        default:
+          throw new Error(`Unknown MCPL proxy method: ${method}`);
+      }
+    });
+  }
+
+  // ==========================================================================
+  // §10: Context Hook Forwarding (beforeInference / afterInference)
+  //
+  // Backend sends hooks → delegate → local MCP servers (that opt in).
+  // Delegate aggregates responses and sends back to backend.
+  // Fail-open: timeout or error → proceed without that server's contribution.
+  // ==========================================================================
+
+  /** §10.6: Per-server timeout for beforeInference forwarding (spec recommends 5s total, we use 4s per server) */
+  const BEFORE_INFERENCE_TIMEOUT_MS = 4_000;
+  /** §10.6: Per-server timeout for afterInference blocking (spec recommends 10s total, we use 8s per server) */
+  const AFTER_INFERENCE_TIMEOUT_MS = 8_000;
+
+  /**
+   * §10.1-10.2: Forward beforeInference to hook-capable MCP servers.
+   * Sends context/beforeInference request to each, aggregates contextInjections.
+   * Fail-open: any server timeout/error is logged but doesn't block the response.
+   */
+  connection.on('mcpl_before_inference', async (msg: any) => {
+    const hookServers = mcpHost.getBeforeInferenceServers();
+
+    if (hookServers.length === 0) {
+      // No hook-capable servers — respond with empty injections
+      connection.sendBeforeInferenceResponse(msg.requestId, []);
+      return;
+    }
+
+    // Forward to all servers in parallel with per-server timeout
+    // B1 fix: content supports string | ContentBlock[] per spec §10.3
+    const allInjections: Array<{
+      namespace: string;
+      position: 'system' | 'beforeUser' | 'afterUser';
+      content: string | import('./mcpl-types.js').McplContentBlock[];
+      metadata?: Record<string, unknown>;
+    }> = [];
+    let aggregatedAbort = false;
+    let aggregatedAbortReason: string | undefined;
+
+    const hookParams = {
+      inferenceId: msg.inferenceId || msg.requestId,
+      conversationId: msg.conversationId,
+      turnIndex: msg.turnIndex,
+      userMessage: msg.userMessage ?? null,
+      model: msg.model,
+    };
+
+    const results = await Promise.allSettled(
+      hookServers.map(async ({ name, client }) => {
+        const abortController = new AbortController();
+        const timer = setTimeout(() => abortController.abort(), BEFORE_INFERENCE_TIMEOUT_MS);
+        try {
+          // Send context/beforeInference as JSON-RPC request via MCP transport
+          const result = await (client as any).request(
+            { method: 'context/beforeInference', params: hookParams },
+            { parse: (v: unknown) => v },  // passthrough schema — accept any result
+            { signal: abortController.signal, timeout: BEFORE_INFERENCE_TIMEOUT_MS + 500 },
+          ) as Record<string, unknown>;
+          clearTimeout(timer);
+
+          // B3: Check abort flag (spec §10.2)
+          if (result?.abort === true && !aggregatedAbort) {
+            aggregatedAbort = true;
+            aggregatedAbortReason = typeof result.abortReason === 'string'
+              ? result.abortReason : `Aborted by ${name}`;
+            console.warn(`[Hooks] beforeInference abort from "${name}": ${aggregatedAbortReason}`);
+          }
+
+          // Extract contextInjections from result (spec §10.2)
+          const injections = result?.contextInjections;
+          if (Array.isArray(injections)) {
+            for (const inj of injections) {
+              if (inj && typeof inj === 'object' && typeof (inj as any).namespace === 'string') {
+                // B1: Preserve content type — pass through string or ContentBlock[]
+                const rawContent = (inj as any).content;
+                const content = (typeof rawContent === 'string' || Array.isArray(rawContent))
+                  ? rawContent : '';
+                allInjections.push({
+                  namespace: (inj as any).namespace,
+                  position: (inj as any).position || 'system',
+                  content,
+                  ...((inj as any).metadata ? { metadata: (inj as any).metadata } : {}),
+                });
+              }
+            }
+          }
+          return { server: name, featureSet: result?.featureSet };
+        } catch (err) {
+          clearTimeout(timer);
+          const errMsg = err instanceof Error ? err.message : String(err);
+          // §10.6: fail-open — log and continue without this server's contribution
+          console.warn(`[Hooks] beforeInference timeout/error from "${name}": ${errMsg}`);
+          return { server: name, error: errMsg };
+        }
+      })
+    );
+
+    // §10.8: Sort injections by namespace for deterministic ordering
+    allInjections.sort((a, b) => a.namespace.localeCompare(b.namespace));
+
+    // Log aggregated result
+    const succeeded = results.filter(r => r.status === 'fulfilled' && !(r.value as any).error).length;
+    if (allInjections.length > 0 || hookServers.length > 1) {
+      console.log(`[Hooks] beforeInference: ${succeeded}/${hookServers.length} servers, ${allInjections.length} injection(s)`);
+    }
+
+    // Send aggregated response back to backend (B3: include abort if any server requested it)
+    connection.sendBeforeInferenceResponse(msg.requestId, allInjections, undefined, aggregatedAbort, aggregatedAbortReason);
+  });
+
+  /**
+   * §10.5: Forward afterInference to hook-capable MCP servers.
+   * - Non-blocking servers: fire-and-forget notification (no response expected)
+   * - Blocking servers: send request and wait for response (may modify response)
+   * Ack is sent immediately after blocking servers respond (or timeout).
+   */
+  connection.on('mcpl_after_inference', async (msg: any) => {
+    const hookServers = mcpHost.getAfterInferenceServers();
+
+    if (hookServers.length === 0) {
+      // No hook-capable servers — send ack immediately
+      try {
+        connection.send({ type: 'mcpl/afterInference_ack', requestId: msg.requestId });
+      } catch { /* ignore */ }
+      return;
+    }
+
+    const hookParams = {
+      inferenceId: msg.inferenceId || msg.requestId,
+      conversationId: msg.conversationId,
+      turnIndex: msg.turnIndex,
+      userMessage: msg.userMessage ?? null,
+      assistantMessage: msg.assistantMessage ?? null,
+      model: msg.model,
+      usage: msg.usage,
+    };
+
+    // Separate blocking vs non-blocking servers
+    // B5: Sort by server name for deterministic modifiedResponse ordering (last-write-wins)
+    const blockingServers = hookServers.filter(s => s.blocking).sort((a, b) => a.name.localeCompare(b.name));
+    const nonBlockingServers = hookServers.filter(s => !s.blocking);
+
+    // L2: Fire-and-forget for non-blocking servers — parallel, not sequential
+    await Promise.allSettled(nonBlockingServers.map(({ name, client }) =>
+      (client as any).notification(
+        { method: 'context/afterInference', params: hookParams },
+      ).catch((err: unknown) => {
+        console.warn(`[Hooks] afterInference notification to "${name}" failed: ${err instanceof Error ? err.message : String(err)}`);
+      })
+    ));
+
+    // For blocking servers: send request, wait for response, may get modifiedResponse
+    if (blockingServers.length === 0) {
+      // All servers non-blocking — send ack
+      try {
+        connection.send({ type: 'mcpl/afterInference_ack', requestId: msg.requestId });
+      } catch { /* ignore */ }
+      return;
+    }
+
+    // Forward to blocking servers in parallel with timeout
+    let modifiedResponse: string | undefined;
+    let responseFeatureSet: string | undefined;
+    let responseMetadata: Record<string, unknown> | undefined;
+
+    const results = await Promise.allSettled(
+      blockingServers.map(async ({ name, client }) => {
+        const abortController = new AbortController();
+        const timer = setTimeout(() => abortController.abort(), AFTER_INFERENCE_TIMEOUT_MS);
+        try {
+          const result = await (client as any).request(
+            { method: 'context/afterInference', params: hookParams },
+            { parse: (v: unknown) => v },  // passthrough schema
+            { signal: abortController.signal, timeout: AFTER_INFERENCE_TIMEOUT_MS + 500 },
+          ) as Record<string, unknown>;
+          clearTimeout(timer);
+
+          // §10.5: blocking afterInference can return modifiedResponse
+          if (typeof result?.modifiedResponse === 'string') {
+            // Last-write-wins if multiple blocking servers modify response
+            modifiedResponse = result.modifiedResponse;
+            responseFeatureSet = result.featureSet as string | undefined;
+            responseMetadata = result.metadata as Record<string, unknown> | undefined;
+          }
+          return { server: name, modified: !!result?.modifiedResponse };
+        } catch (err) {
+          clearTimeout(timer);
+          // §10.6: fail-open — timeout/error means proceed without modification
+          console.warn(`[Hooks] afterInference timeout/error from "${name}": ${err instanceof Error ? err.message : String(err)}`);
+          return { server: name, error: true };
+        }
+      })
+    );
+
+    const succeeded = results.filter(r => r.status === 'fulfilled' && !(r.value as any).error).length;
+    console.log(`[Hooks] afterInference: ${succeeded}/${blockingServers.length} blocking, ${nonBlockingServers.length} non-blocking`);
+
+    // Send response (full response if any server modified, otherwise ack)
+    if (modifiedResponse !== undefined) {
+      connection.sendAfterInferenceResponse(msg.requestId, {
+        modifiedResponse,
+        featureSet: responseFeatureSet,
+        metadata: responseMetadata,
+      });
+    } else {
+      try {
+        connection.send({ type: 'mcpl/afterInference_ack', requestId: msg.requestId });
+      } catch { /* ignore */ }
+    }
+  });
+
+  // ==========================================================================
+  // MCPL Response Handlers
+  //
+  // These events are emitted by connection.ts when the backend sends responses
+  // to requests the delegate (or its MCP servers) initiated. A pending-request
+  // Map correlates requestId → resolve/reject so callers get their answer.
+  // ==========================================================================
+
+  /** Pending request store: requestId → { resolve, reject, timer } */
+  const pendingRequests = new Map<string, {
+    resolve: (value: any) => void;
+    reject: (reason: any) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+
+  /** Register a pending request with timeout. Returns a promise that resolves when the response arrives. */
+  function registerPendingRequest(requestId: string, timeoutMs = 30_000): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingRequests.delete(requestId);
+        reject(new Error(`MCPL request ${requestId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      pendingRequests.set(requestId, { resolve, reject, timer });
+    });
+  }
+
+  /** Resolve a pending request by requestId. Returns true if found. */
+  function resolvePendingRequest(requestId: string | undefined, data: any): boolean {
+    if (!requestId) return false;
+    const pending = pendingRequests.get(requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    pendingRequests.delete(requestId);
+    pending.resolve(data);
+    return true;
+  }
+
+  // §6.7: featureSets_update — backend changes which featureSets are enabled/disabled
+  // connection.ts already updates _enabledFeatureSets; B4: also notify MCP servers
+  connection.on('mcpl_featureSets_update', (msg: any) => {
+    const enabled: string[] = msg.enabled || [];
+    const disabled: string[] = msg.disabled || [];
+    console.log(`[Main] featureSets/update: enabled=[${enabled.join(', ')}], disabled=[${disabled.join(', ')}]`);
+
+    // Bug 2: Include scopes (whitelist/blacklist) in forwarded notification
+    const scopes = msg.scopes || undefined;
+    if (scopes) {
+      console.log(`[Main] featureSets/update includes scopes for ${Object.keys(scopes).length} featureSet(s)`);
+    }
+
+    // B4: Forward to MCP servers as JSON-RPC notification (best-effort)
+    for (const server of mcpHost.allServers.values()) {
+      try {
+        (server.client as any).notification?.({
+          method: 'featureSets/update',
+          params: { enabled, disabled, ...(scopes ? { scopes } : {}) },
+        });
+      } catch {
+        // MCP servers may not handle this notification — that's OK
+      }
+    }
+  });
+
+  // §11: inference_response — backend returns inference result
+  connection.on('mcpl_inference_response', (msg: any) => {
+    if (!resolvePendingRequest(msg.requestId, msg)) {
+      console.warn(`[Main] Unmatched inference_response (requestId: ${msg.requestId})`);
+    }
+  });
+
+  // §11: inference_chunk — backend streams inference chunks
+  connection.on('mcpl_inference_chunk', (msg: any) => {
+    // Chunks don't resolve the request — they're intermediate.
+    // Forward to a chunk callback if registered.
+    const pending = pendingRequests.get(msg.requestId);
+    if (!pending) {
+      console.warn(`[Main] Unmatched inference_chunk (requestId: ${msg.requestId})`);
+    }
+    // TODO: when MCP servers support streaming inference, forward chunks here
+  });
+
+  // §8: state_response — backend returns state data (state_get or state_rollback result)
+  connection.on('mcpl_state_response', (msg: any) => {
+    if (!resolvePendingRequest(msg.requestId, msg)) {
+      console.warn(`[Main] Unmatched state_response (requestId: ${msg.requestId})`);
+    }
+  });
+
+  // §8: state_patch_result — backend confirms state patch applied
+  connection.on('mcpl_state_patch_result', (msg: any) => {
+    if (!resolvePendingRequest(msg.requestId, msg)) {
+      console.warn(`[Main] Unmatched state_patch_result (requestId: ${msg.requestId})`);
+    }
+  });
+
+  // §8: checkpoint_list_response — backend returns checkpoint tree
+  connection.on('mcpl_checkpoint_list_response', (msg: any) => {
+    if (!resolvePendingRequest(msg.requestId, msg)) {
+      console.warn(`[Main] Unmatched checkpoint_list_response (requestId: ${msg.requestId})`);
+    }
+  });
+
+  // §9: push_event_response — backend accepted/denied push event
+  connection.on('mcpl_push_event_response', (msg: any) => {
+    const status = msg.accepted ? 'accepted' : `denied: ${msg.reason || 'unknown'}`;
+    console.log(`[Main] Push event ${msg.requestId}: ${status}`);
+    resolvePendingRequest(msg.requestId, msg);
+  });
+
+  // §7: scope_change_result — backend approved/denied scope change
+  connection.on('mcpl_scope_change_result', (msg: any) => {
+    if (!resolvePendingRequest(msg.requestId, msg)) {
+      console.log(`[Main] Scope change ${msg.requestId}: ${msg.approved ? 'approved' : 'denied'}`);
+    }
+  });
+
+  // §12: model_info_response — backend returns model metadata
+  connection.on('mcpl_model_info_response', (msg: any) => {
+    if (!resolvePendingRequest(msg.requestId, msg)) {
+      console.warn(`[Main] Unmatched model_info_response (requestId: ${msg.requestId})`);
+    }
+  });
+
+  // §5: tool_manifest_ack — backend confirmed tool manifest receipt
+  connection.on('tool_manifest_ack', (msg: any) => {
+    console.log(`[Main] Tool manifest acknowledged (${msg.toolCount ?? '?'} tools)`);
+    if (msg.warnings?.length) {
+      for (const w of msg.warnings) {
+        console.warn(`[Main] Tool rejected: "${w.toolName}" — ${w.reason}`);
+      }
+    }
+  });
+
+  // §11: trigger_inference_result — backend confirmed trigger inference
+  connection.on('trigger_inference_result', (msg: any) => {
+    if (!resolvePendingRequest(msg.requestId, msg)) {
+      console.log(`[Main] Trigger inference result: ${msg.success ? 'ok' : msg.error || 'failed'}`);
+    }
+  });
+
+  // §15: mcpl_error — protocol-level error from backend
+  connection.on('mcpl_error', (msg: any) => {
+    const inReplyTo = msg.inReplyTo?.type || msg.inReplyTo?.requestId;
+    console.error(`[Main] MCPL error: code=${msg.code} "${msg.message}"${inReplyTo ? ` (re: ${inReplyTo})` : ''}`);
+
+    // Try to reject the pending request that caused this error
+    if (msg.inReplyTo?.requestId) {
+      const pending = pendingRequests.get(msg.inReplyTo.requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingRequests.delete(msg.inReplyTo.requestId);
+        pending.reject(new Error(`MCPL error ${msg.code}: ${msg.message}`));
+      }
+    }
+  });
+
+  // Connection state changes (informational)
+  connection.on('state_change', (newState: string) => {
+    console.log(`[Main] Connection state: ${newState}`);
+  });
+
+  // Clean up pending requests on disconnect
+  connection.on('disconnected', () => {
+    if (pendingRequests.size > 0) {
+      console.log(`[Main] Clearing ${pendingRequests.size} pending MCPL request(s) on disconnect`);
+      for (const [id, pending] of pendingRequests) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('Disconnected'));
+      }
+      pendingRequests.clear();
+    }
+  });
+
+  // Export registerPendingRequest for use by MCP server request forwarding
+  (connection as any)._registerPendingRequest = registerPendingRequest;
 
   // Connect to server
   await connection.connect();
@@ -982,7 +1580,7 @@ async function main(): Promise<void> {
         }
       }
 
-      const freshConfig = loadConfig(findConfigPath(opts.config));
+      const freshConfig = loadConfig(findConfigPath(configPath));
       mcpHost.setMcpConfigs(freshConfig.mcp_servers);
       await mcpHost.stopAll();
       await mcpHost.startAll(freshConfig.mcp_servers);
@@ -993,6 +1591,11 @@ async function main(): Promise<void> {
 
       const newTools = mcpHost.getAllToolsWithServer();
       connection.sendToolManifest(newTools, undefined, 'config_reload');
+      // §6.1: Update featureSets after reload (full replacement via added)
+      if (connection.isMcpl) {
+        const featureSets = mcpHost.buildFeatureSets();
+        connection.sendFeatureSetsChanged({ added: featureSets });
+      }
       bus.setTools(newTools.map(t => ({ name: t.name, server: (t as any).serverName || '' })));
       bus.setSetupStep('reload', 'ok', `${newTools.length} tools`);
     } catch (err: any) {

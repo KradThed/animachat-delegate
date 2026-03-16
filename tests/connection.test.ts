@@ -143,9 +143,9 @@ describe('DelegateConnection', () => {
       expect((conn as any).options.delegateName).toBe('My Display Name');
     });
 
-    it('sets default mcplCapabilities to empty array', () => {
+    it('sets default mcplCapabilities to empty object', () => {
       const conn = new DelegateConnection(defaultOptions());
-      expect((conn as any).options.mcplCapabilities).toEqual([]);
+      expect((conn as any).options.mcplCapabilities).toEqual({});
     });
 
     it('preserves user-supplied options', () => {
@@ -818,7 +818,7 @@ describe('DelegateConnection', () => {
   describe('MCPL connection flow', () => {
     it('sends mcpl/hello after auth success when mcplCapabilities configured', async () => {
       const conn = new DelegateConnection(
-        defaultOptions({ mcplCapabilities: ['context_hooks', 'push_events'] }),
+        defaultOptions({ mcplCapabilities: { context_hooks: true, push_events: true } }),
       );
 
       const connectPromise = conn.connect();
@@ -838,26 +838,33 @@ describe('DelegateConnection', () => {
         })),
       );
 
-      // Should have sent mcpl/hello
+      // Should have sent MCP initialize with MCPL capabilities nested under experimental.mcpl
       expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
       const hello = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
-      expect(hello.type).toBe('mcpl/hello');
-      expect(hello.protocolVersion).toBe('mcpl-1.0');
-      expect(hello.capabilities).toEqual(['context_hooks', 'push_events']);
+      expect(hello.jsonrpc).toBe('2.0');
+      expect(hello.method).toBe('initialize');
+      expect(hello.params.protocolVersion).toBe('2024-11-05');
+      expect(hello.params.capabilities.experimental.mcpl.context_hooks).toBe(true);
+      expect(hello.params.capabilities.experimental.mcpl.push_events).toBe(true);
 
       // Should still be authenticating (waiting for mcpl/ack)
       expect(conn.currentState).toBe('authenticating');
 
-      // Now send mcpl/ack as JSON-RPC 2.0 response (server encodes via McplCodec)
+      // Now send mcpl/ack as JSON-RPC 2.0 response
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({
           jsonrpc: '2.0',
-          id: hello.requestId,
+          id: hello.id,
           result: {
-            sessionId: 'mcpl-sess-1',
-            negotiatedCapabilities: ['context_hooks'],
-            featureSets: { server1: { contextHooks: true, pushEvents: false, inferenceRequests: false, toolManagement: false } },
+            _mcpl: { sessionId: 'mcpl-sess-1' },
+            capabilities: {
+              experimental: {
+                mcpl: {
+                  featureSets: { server1: { contextHooks: true, pushEvents: false, inferenceRequests: false, toolManagement: false } },
+                },
+              },
+            },
           },
         })),
       );
@@ -871,7 +878,7 @@ describe('DelegateConnection', () => {
 
     it('emits mcpl_ack event on successful MCPL handshake', async () => {
       const conn = new DelegateConnection(
-        defaultOptions({ mcplCapabilities: ['context_hooks'] }),
+        defaultOptions({ mcplCapabilities: { context_hooks: true } }),
       );
       const ackSpy = vi.fn();
       conn.on('mcpl_ack', ackSpy);
@@ -889,17 +896,16 @@ describe('DelegateConnection', () => {
           userId: 'u1',
         })),
       );
-      // Capture hello requestId for JSON-RPC correlation
+      // Capture hello id for JSON-RPC correlation
       const hello = JSON.parse(mockWsInstance.send.mock.calls[mockWsInstance.send.mock.calls.length - 1][0]);
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({
           jsonrpc: '2.0',
-          id: hello.requestId,
+          id: hello.id,
           result: {
-            sessionId: 'mcpl-sess-1',
-            negotiatedCapabilities: ['context_hooks'],
-            featureSets: {},
+            _mcpl: { sessionId: 'mcpl-sess-1' },
+            capabilities: { experimental: { mcpl: { featureSets: {} } } },
           },
         })),
       );
@@ -910,7 +916,7 @@ describe('DelegateConnection', () => {
 
     it('resets RC state on new MCPL session (no resumedFromSeq)', async () => {
       const conn = new DelegateConnection(
-        defaultOptions({ mcplCapabilities: ['context_hooks'] }),
+        defaultOptions({ mcplCapabilities: { context_hooks: true } }),
       );
 
       // Pre-set RC state to simulate a prior session
@@ -931,17 +937,16 @@ describe('DelegateConnection', () => {
           userId: 'u1',
         })),
       );
-      // Capture hello requestId for JSON-RPC correlation
+      // Capture hello id for JSON-RPC correlation
       const hello3 = JSON.parse(mockWsInstance.send.mock.calls[mockWsInstance.send.mock.calls.length - 1][0]);
       mockWsInstance.emit(
         'message',
         Buffer.from(JSON.stringify({
           jsonrpc: '2.0',
-          id: hello3.requestId,
+          id: hello3.id,
           result: {
-            sessionId: 'mcpl-sess-new',
-            negotiatedCapabilities: [],
-            featureSets: {},
+            _mcpl: { sessionId: 'mcpl-sess-new' },
+            capabilities: { experimental: { mcpl: { featureSets: {} } } },
           },
         })),
       );
@@ -1098,7 +1103,7 @@ describe('DelegateConnection', () => {
       expect(spy).toHaveBeenCalledTimes(1);
     });
 
-    it('emits mcpl_after_inference and auto-acks for mcpl/afterInference', async () => {
+    it('emits mcpl_after_inference when listener registered (no auto-ack)', async () => {
       const conn = new DelegateConnection(defaultOptions());
       await connectAndAuth(conn);
 
@@ -1110,7 +1115,22 @@ describe('DelegateConnection', () => {
       (conn as any).handleMcplMessage({ type: 'mcpl/afterInference', requestId: 'r1', conversationId: 'c1' });
 
       expect(spy).toHaveBeenCalledTimes(1);
-      // Should have auto-sent afterInference_ack
+      // B7: when listener is registered, auto-ack is NOT sent — listener must call sendAfterInferenceResponse
+      expect(mockWsInstance.send).not.toHaveBeenCalled();
+    });
+
+    it('auto-acks mcpl/afterInference when no listener registered', async () => {
+      const conn = new DelegateConnection(defaultOptions());
+      await connectAndAuth(conn);
+
+      (conn as any)._isMcpl = false; // avoid RC framing for simplicity
+      // No listener registered for mcpl_after_inference
+      mockWsInstance.send.mockClear();
+
+      (conn as any).handleMcplMessage({ type: 'mcpl/afterInference', requestId: 'r1', conversationId: 'c1' });
+
+      // Should have auto-sent afterInference_ack since no listener
+      expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
       expect(sent.type).toBe('mcpl/afterInference_ack');
       expect(sent.requestId).toBe('r1');
@@ -1318,9 +1338,10 @@ describe('DelegateConnection', () => {
       const conn = new DelegateConnection(defaultOptions());
       const spy = vi.spyOn(conn as any, 'handleMcplMessage');
 
-      // Pre-populate buffer with outgoing frame
-      (conn as any).rcBuffer.set(1, { seq: 1, ack: 0, payload: {} });
-      (conn as any).rcBuffer.set(2, { seq: 2, ack: 0, payload: {} });
+      // Pre-populate buffer with outgoing frame (DEL-1: { frame, ts } format)
+      (conn as any).rcOutSeq = 2;
+      (conn as any).rcBuffer.set(1, { frame: { seq: 1, ack: 0, payload: {} }, ts: Date.now() });
+      (conn as any).rcBuffer.set(2, { frame: { seq: 2, ack: 0, payload: {} }, ts: Date.now() });
 
       // Receive bare ack for seq up to 1
       (conn as any).handleReliableFrame({ seq: 0, ack: 1 });
@@ -1334,9 +1355,11 @@ describe('DelegateConnection', () => {
     it('frees confirmed outbound frames from rcBuffer on ack', () => {
       const conn = new DelegateConnection(defaultOptions());
 
-      (conn as any).rcBuffer.set(1, { seq: 1, ack: 0, payload: {} });
-      (conn as any).rcBuffer.set(2, { seq: 2, ack: 0, payload: {} });
-      (conn as any).rcBuffer.set(3, { seq: 3, ack: 0, payload: {} });
+      // DEL-1: rcBuffer stores { frame, ts }; must set rcOutSeq for ack upper bound check
+      (conn as any).rcOutSeq = 3;
+      (conn as any).rcBuffer.set(1, { frame: { seq: 1, ack: 0, payload: {} }, ts: Date.now() });
+      (conn as any).rcBuffer.set(2, { frame: { seq: 2, ack: 0, payload: {} }, ts: Date.now() });
+      (conn as any).rcBuffer.set(3, { frame: { seq: 3, ack: 0, payload: {} }, ts: Date.now() });
 
       // Receive frame with ack=2
       (conn as any).handleReliableFrame({ seq: 1, ack: 2, payload: { type: 'mcpl/test' } });
@@ -1350,6 +1373,9 @@ describe('DelegateConnection', () => {
     it('handles frame without payload as bare ack', () => {
       const conn = new DelegateConnection(defaultOptions());
       const spy = vi.spyOn(conn as any, 'handleMcplMessage');
+
+      // Must set rcOutSeq so ack upper bound check passes
+      (conn as any).rcOutSeq = 5;
 
       // seq=0 with no payload
       (conn as any).handleReliableFrame({ seq: 0, ack: 3 });
@@ -1672,14 +1698,14 @@ describe('DelegateConnection', () => {
       mockWsInstance.send.mockClear();
 
       conn.sendBeforeInferenceResponse('req-1', [
-        { serverId: 's1', position: 'system', content: 'context data' },
+        { namespace: 's1', position: 'system', content: 'context data' },
       ]);
 
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
       expect(sent.type).toBe('mcpl/beforeInference_response');
       expect(sent.requestId).toBe('req-1');
-      expect(sent.injections).toHaveLength(1);
-      expect(sent.injections[0].position).toBe('system');
+      expect(sent.contextInjections).toHaveLength(1);
+      expect(sent.contextInjections[0].position).toBe('system');
     });
 
     it('sendPushEvent includes timestamp', async () => {
@@ -1763,13 +1789,16 @@ describe('DelegateConnection', () => {
       await connectAndAuth(conn);
       mockWsInstance.send.mockClear();
 
+      // P2: featureSet must be enabled for the request to succeed
+      (conn as any)._enabledFeatureSets.add('fs1');
+
       conn.sendScopeElevateRequest({
         requestId: 'r1',
         delegateId: 'd1',
         serverId: 's1',
         conversationId: 'c1',
         featureSet: 'fs1',
-        label: 'Elevate label',
+        scope: { label: 'Elevate label' },
         requestedCapabilities: ['push_events'],
         reason: 'Need push events',
       });
@@ -1784,14 +1813,14 @@ describe('DelegateConnection', () => {
       await connectAndAuth(conn);
       mockWsInstance.send.mockClear();
 
-      const featureSets = {
+      const added = {
         server1: { contextHooks: true, pushEvents: false, inferenceRequests: false, toolManagement: false },
       };
-      conn.sendFeatureSetsChanged(featureSets);
+      conn.sendFeatureSetsChanged({ added });
 
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
       expect(sent.type).toBe('mcpl/featureSets_changed');
-      expect(sent.featureSets).toEqual(featureSets);
+      expect(sent.added).toEqual(added);
     });
 
     it('sendStateSet sends correct format', async () => {
@@ -1821,27 +1850,18 @@ describe('DelegateConnection', () => {
       expect(sent.patch).toEqual(patch);
     });
 
-    it('sendStateRollback sends correct format without checkpointId', async () => {
+    it('sendStateRollback sends correct format', async () => {
       const conn = new DelegateConnection(defaultOptions());
       await connectAndAuth(conn);
       mockWsInstance.send.mockClear();
 
-      conn.sendStateRollback('r1', 'c1');
+      conn.sendStateRollback('r1', 'fs1', 'cp-1');
 
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
       expect(sent.type).toBe('mcpl/state_rollback');
-      expect(sent).not.toHaveProperty('checkpointId');
-    });
-
-    it('sendStateRollback includes checkpointId when provided', async () => {
-      const conn = new DelegateConnection(defaultOptions());
-      await connectAndAuth(conn);
-      mockWsInstance.send.mockClear();
-
-      conn.sendStateRollback('r1', 'c1', 'cp-42');
-
-      const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
-      expect(sent.checkpointId).toBe('cp-42');
+      expect(sent.requestId).toBe('r1');
+      expect(sent.featureSet).toBe('fs1');
+      expect(sent.checkpoint).toBe('cp-1');
     });
 
     it('sendCheckpointList sends correct format', async () => {
@@ -1879,6 +1899,20 @@ describe('DelegateConnection', () => {
       const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
       expect(sent.type).toBe('mcpl/model_info_request');
       expect(sent.requestId).toBe('r1');
+      expect(sent.conversationId).toBeUndefined();
+    });
+
+    it('sendModelInfoRequest includes conversationId when provided', async () => {
+      const conn = new DelegateConnection(defaultOptions());
+      await connectAndAuth(conn);
+      mockWsInstance.send.mockClear();
+
+      conn.sendModelInfoRequest('r2', 'conv-123');
+
+      const sent = JSON.parse(mockWsInstance.send.mock.calls[0][0]);
+      expect(sent.type).toBe('mcpl/model_info_request');
+      expect(sent.requestId).toBe('r2');
+      expect(sent.conversationId).toBe('conv-123');
     });
   });
 

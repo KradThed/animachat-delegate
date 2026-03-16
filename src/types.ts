@@ -18,6 +18,7 @@ export const ToolDefinitionSchema = z.object({
     required: z.array(z.string()).optional(),
   }),
   serverName: z.string().optional(),
+  featureSet: z.string().optional(),  // explicit featureSet name from delegate
 });
 
 export type ToolDefinition = z.infer<typeof ToolDefinitionSchema>;
@@ -32,7 +33,7 @@ export const DelegateAuthResultSchema = z.object({
   userId: z.string().optional(),
   sessionId: z.string().optional(),
   error: z.string().optional(),
-});
+}).passthrough();  // C1: tolerate unknown fields
 
 export const ToolCallRequestSchema = z.object({
   type: z.literal('tool_call_request'),
@@ -49,7 +50,16 @@ export const ToolCallRequestSchema = z.object({
     chainId: z.string(),
     frameId: z.string(),
   }).optional(),
-});
+  // H7: Spec §8.4 — state/checkpoint at params top level (not in mcplState wrapper)
+  state: z.record(z.unknown()).nullable().optional(),
+  checkpoint: z.string().optional(),
+  stateVersion: z.number().optional(),
+  // P1: Spec §7.7 — scope tagging for scoped tool calls
+  scope: z.object({
+    label: z.string(),
+    payload: z.record(z.unknown()).optional(),
+  }).optional(),
+}).passthrough();  // C1: Tolerate unknown fields per spec §8 compatibility note
 
 export const TriggerInferenceResultSchema = z.object({
   type: z.literal('trigger_inference_result'),
@@ -70,6 +80,10 @@ export const ToolManifestAckSchema = z.object({
   type: z.literal('tool_manifest_ack'),
   toolCount: z.number(),
   tools: z.array(z.string()),
+  warnings: z.array(z.object({
+    toolName: z.string(),
+    reason: z.string(),
+  })).optional(),
 });
 
 /** All messages the server can send to us */

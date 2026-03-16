@@ -18,6 +18,8 @@ import {
   RESPONSE_TYPE_MAP,
   REQUEST_TO_RESPONSE_TYPE,
   NOTIFICATION_TYPES,
+  INTERNAL_TO_WIRE,
+  WIRE_TO_INTERNAL,
   isJsonRpcRequest,
   isJsonRpcNotification,
   isJsonRpcResponse,
@@ -81,12 +83,15 @@ export class McplCodec {
       };
     }
 
+    // F1 fix: Translate internal method name → spec wire name
+    const wireMethod = INTERNAL_TO_WIRE[type] ?? type;
+
     // 3. Notification — fire-and-forget, no id
     if (NOTIFICATION_TYPES.has(type)) {
       const { type: _, ...rest } = msg;
       return {
         jsonrpc: '2.0',
-        method: type,
+        method: wireMethod,
         params: rest,
       };
     }
@@ -97,7 +102,7 @@ export class McplCodec {
       console.warn(`[McplCodec] Request "${type}" has no requestId — encoding as notification`);
       return {
         jsonrpc: '2.0',
-        method: type,
+        method: wireMethod,
         params: rest,
       };
     }
@@ -105,7 +110,7 @@ export class McplCodec {
     return {
       jsonrpc: '2.0',
       id: requestId,
-      method: type,
+      method: wireMethod,
       params: rest,
     };
   }
@@ -158,13 +163,19 @@ export class McplCodec {
         // Find the internal response type for this method
         const responseType = REQUEST_TO_RESPONSE_TYPE[method];
         if (responseType) {
-          const resultObj = (result && typeof result === 'object' && !Array.isArray(result))
-            ? result as Record<string, unknown>
-            : {};
+          // M2 fix: preserve non-object results (primitives, arrays) in a `result` field
+          // instead of silently dropping them
+          if (result && typeof result === 'object' && !Array.isArray(result)) {
+            return {
+              type: responseType,
+              requestId: id,
+              ...(result as Record<string, unknown>),
+            };
+          }
           return {
             type: responseType,
             requestId: id,
-            ...resultObj,
+            result,
           };
         }
       }
@@ -180,14 +191,16 @@ export class McplCodec {
 
     // 3. Request (has method + id)
     if (isJsonRpcRequest(raw)) {
-      const method = raw.method as string;
+      const wireMethod = raw.method as string;
+      // F1 fix: Translate spec wire name → internal name
+      const internalType = WIRE_TO_INTERNAL[wireMethod] ?? wireMethod;
       const id = raw.id as string | number;
       const params = (raw.params && typeof raw.params === 'object')
         ? raw.params as Record<string, unknown>
         : {};
 
       return {
-        type: method,
+        type: internalType,
         requestId: id,
         ...params,
       };
@@ -195,13 +208,15 @@ export class McplCodec {
 
     // 4. Notification (has method, no id)
     if (isJsonRpcNotification(raw)) {
-      const method = raw.method as string;
+      const wireMethod = raw.method as string;
+      // F1 fix: Translate spec wire name → internal name
+      const internalType = WIRE_TO_INTERNAL[wireMethod] ?? wireMethod;
       const params = (raw.params && typeof raw.params === 'object')
         ? raw.params as Record<string, unknown>
         : {};
 
       return {
-        type: method,
+        type: internalType,
         ...params,
       };
     }

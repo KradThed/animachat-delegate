@@ -17,6 +17,32 @@ import type { McpServerConfig, ToolDefinition } from './types.js';
 // Helpers
 // =============================================================================
 
+/**
+ * S-5 fix: Allowlist of environment variables safe to pass to child MCP servers.
+ * Only these + config.env are forwarded. Everything else (API keys, tokens,
+ * database URLs) is stripped to prevent secret leakage to untrusted servers.
+ */
+const SAFE_ENV_VARS = [
+  'PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE',
+  'TERM', 'COLORTERM', 'EDITOR',
+  'TMPDIR', 'TMP', 'TEMP',
+  'NODE_ENV', 'NODE_PATH', 'NODE_OPTIONS',
+  'SYSTEMROOT', 'COMSPEC', 'WINDIR',     // Windows essentials
+  'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+  'PROGRAMFILES', 'PROGRAMFILES(X86)', 'COMMONPROGRAMFILES',
+  'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE',
+  'OS', 'SYSTEMDRIVE',
+];
+
+function getSafeEnv(): Record<string, string> {
+  const safe: Record<string, string> = {};
+  for (const key of SAFE_ENV_VARS) {
+    const val = process.env[key];
+    if (val !== undefined) safe[key] = val;
+  }
+  return safe;
+}
+
 /** Race a promise against a timeout. Rejects with TimeoutError on expiry. */
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -32,11 +58,31 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 // Types
 // =============================================================================
 
+/** Hook capabilities advertised by an MCP server via experimental.mcpl */
+export interface McpHookCapabilities {
+  beforeInference?: boolean;
+  afterInference?: boolean | { blocking?: boolean };
+}
+
+/** Parsed MCPL capabilities from a server's experimental.mcpl declaration */
+export interface McpServerMcplCaps {
+  hooks?: McpHookCapabilities;
+  pushEvents?: boolean;
+  inferenceRequest?: boolean;
+  scoped?: boolean;
+  rollback?: boolean;
+  channels?: { publish?: boolean; observe?: boolean };
+}
+
 interface McpServer {
   name: string;
   client: Client;
   transport: StdioClientTransport | SSEClientTransport;
   tools: ToolDefinition[];
+  /** §10: Hook capabilities parsed from server's MCP initialize result */
+  mcplHooks?: McpHookCapabilities;
+  /** All MCPL capabilities parsed from server's experimental.mcpl */
+  mcplCaps?: McpServerMcplCaps;
 }
 
 export interface DuplicateToolWarning {
@@ -52,16 +98,16 @@ export interface DuplicateToolWarning {
 /** Virtual tool injected into tool list so MCP servers can request capability elevation */
 const SCOPE_ELEVATE_TOOL: ToolDefinition = {
   name: '_scope_elevate',
-  description: 'Request capability elevation from the user. Returns { approved: boolean, newCapabilities?: string[] }.',
+  description: 'Request scope elevation per spec §7.4. Returns { approved: boolean, payload?: object, reason?: string }.',
   inputSchema: {
     type: 'object',
     properties: {
-      featureSet: { type: 'string', description: 'Feature set label to elevate' },
-      label: { type: 'string', description: 'Human-readable label for the request' },
+      featureSet: { type: 'string', description: 'Feature set to elevate (spec §7.4)' },
+      label: { type: 'string', description: 'Human-readable scope label for whitelist/blacklist matching' },
+      payload: { type: 'object', description: 'Arbitrary data passed back to server when approved (spec §7.3)' },
       reason: { type: 'string', description: 'Why elevation is needed' },
-      capabilities: { type: 'array', items: { type: 'string' }, description: 'Capabilities to request' },
     },
-    required: ['featureSet', 'label', 'reason', 'capabilities'],
+    required: ['featureSet', 'label'],
   },
 };
 
@@ -118,18 +164,141 @@ const MCP_MANAGEMENT_TOOLS = [
   MCP_RESTART_SERVER_TOOL,
 ];
 
+// ---------------------------------------------------------------------------
+// MCPL Proxy Virtual Tools — let MCP servers access MCPL features via backend
+// ---------------------------------------------------------------------------
+
+/** §11: Request inference from the host (forwarded to backend) */
+const MCPL_INFERENCE_REQUEST_TOOL: ToolDefinition = {
+  name: '_mcpl_inference_request',
+  description: 'Request autonomous inference from the host (spec §11). Returns model response.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      featureSet: { type: 'string', description: 'Declaring feature set' },
+      conversationId: { type: 'string', description: 'Associate with conversation (optional)' },
+      stream: { type: 'boolean', description: 'Stream response (default: false)' },
+      messages: {
+        type: 'array',
+        description: 'Messages for inference',
+        items: {
+          type: 'object',
+          properties: {
+            role: { type: 'string', enum: ['user', 'assistant'] },
+            content: { type: 'string' },
+          },
+          required: ['role', 'content'],
+        },
+      },
+      maxTokens: { type: 'number', description: 'Max output tokens' },
+      temperature: { type: 'number', description: 'Sampling temperature' },
+    },
+    required: ['featureSet', 'messages'],
+  },
+};
+
+/** §8: Get state for a feature set / conversation */
+const MCPL_STATE_GET_TOOL: ToolDefinition = {
+  name: '_mcpl_state_get',
+  description: 'Get persisted state from the host (spec §8). Returns state data.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      conversationId: { type: 'string', description: 'Conversation to get state for' },
+    },
+    required: ['conversationId'],
+  },
+};
+
+/** §8: Patch state via JSON Patch (RFC 6902) */
+const MCPL_STATE_PATCH_TOOL: ToolDefinition = {
+  name: '_mcpl_state_patch',
+  description: 'Apply JSON Patch (RFC 6902) to persisted state (spec §8). Returns patch result.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      conversationId: { type: 'string', description: 'Conversation to patch state for' },
+      patch: {
+        type: 'array',
+        description: 'JSON Patch operations (RFC 6902)',
+        items: { type: 'object' },
+      },
+    },
+    required: ['conversationId', 'patch'],
+  },
+};
+
+/** §8: Rollback state to a previous checkpoint */
+const MCPL_STATE_ROLLBACK_TOOL: ToolDefinition = {
+  name: '_mcpl_state_rollback',
+  description: 'Rollback state to a previous checkpoint (spec §8.5). Returns rollback result.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      featureSet: { type: 'string', description: 'Feature set to rollback' },
+      checkpoint: { type: 'string', description: 'Checkpoint ID to rollback to' },
+    },
+    required: ['featureSet', 'checkpoint'],
+  },
+};
+
+/** §8: List checkpoints for a conversation */
+const MCPL_CHECKPOINT_LIST_TOOL: ToolDefinition = {
+  name: '_mcpl_checkpoint_list',
+  description: 'List state checkpoints for a conversation (spec §8.7). Returns checkpoint tree.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      conversationId: { type: 'string', description: 'Conversation to list checkpoints for' },
+    },
+    required: ['conversationId'],
+  },
+};
+
+/** §12: Get model info from the host */
+const MCPL_MODEL_INFO_TOOL: ToolDefinition = {
+  name: '_mcpl_model_info',
+  description: 'Get current model metadata from the host (spec §12). Returns id, vendor, contextWindow, capabilities.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      conversationId: { type: 'string', description: 'Optional: resolve model for a specific conversation instead of the default' },
+    },
+  },
+};
+
+const MCPL_PROXY_TOOLS = [
+  MCPL_INFERENCE_REQUEST_TOOL,
+  MCPL_STATE_GET_TOOL,
+  MCPL_STATE_PATCH_TOOL,
+  MCPL_STATE_ROLLBACK_TOOL,
+  MCPL_CHECKPOINT_LIST_TOOL,
+  MCPL_MODEL_INFO_TOOL,
+];
+
 // =============================================================================
 // McpHostManager
 // =============================================================================
 
 export class McpHostManager {
   private servers: Map<string, McpServer> = new Map();
+  /** B4: Public read-only access to servers for featureSets/update forwarding */
+  get allServers(): ReadonlyMap<string, McpServer> { return this.servers; }
   private toolToServer: Map<string, string> = new Map();
   private _duplicateWarnings: DuplicateToolWarning[] = [];
-  private scopeElevateHandler?: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>;
+  private scopeElevateHandler?: (input: Record<string, unknown>) => Promise<{ approved: boolean; payload?: Record<string, unknown>; reason?: string }>;
+
+  /** MCPL proxy handler: forwards requests to backend via connection */
+  private mcplProxyHandler?: (method: string, input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+  /** Whether MCPL proxy tools should be included (true when connection is MCPL) */
+  private mcplEnabled = false;
 
   /** MCP server configs from delegate.yaml (set by setMcpConfigs, used for enable/restart) */
   private mcpConfigs: McpServerConfig[] = [];
+
+  /** C-2 fix: true during stopAll() — onclose handlers skip crash notifications */
+  private stopping = false;
 
   /** Callback when toolset changes (enable/disable/restart/crash) — used for manifest re-send + events */
   onToolsetChanged?: (reason: string, serverName: string) => void;
@@ -149,8 +318,18 @@ export class McpHostManager {
    * Set the handler for _scope_elevate virtual tool calls.
    * Called from index.ts after connection is established.
    */
-  setScopeElevateHandler(handler: (input: Record<string, unknown>) => Promise<{ approved: boolean; newCapabilities?: string[] }>): void {
+  setScopeElevateHandler(handler: (input: Record<string, unknown>) => Promise<{ approved: boolean; payload?: Record<string, unknown>; reason?: string }>): void {
     this.scopeElevateHandler = handler;
+  }
+
+  /**
+   * Set the MCPL proxy handler for forwarding requests to the backend.
+   * Called from index.ts after connection is established.
+   * The handler takes a method name and input, forwards to backend, returns response.
+   */
+  setMcplProxyHandler(handler: (method: string, input: Record<string, unknown>) => Promise<Record<string, unknown>>): void {
+    this.mcplProxyHandler = handler;
+    this.mcplEnabled = true;
   }
 
   /**
@@ -205,6 +384,8 @@ export class McpHostManager {
   async stopAll(): Promise<void> {
     if (this.servers.size === 0) return;
 
+    // C-2 fix: Suppress false crash notifications during graceful shutdown
+    this.stopping = true;
     console.log(`[McpHost] Stopping ${this.servers.size} MCP server(s)...`);
 
     await Promise.allSettled(
@@ -221,6 +402,7 @@ export class McpHostManager {
     this.servers.clear();
     this.toolToServer.clear();
     this._duplicateWarnings = [];
+    this.stopping = false;  // B2 fix: re-enable crash detection after shutdown
   }
 
   /**
@@ -248,7 +430,7 @@ export class McpHostManager {
       if (!server) continue;
       const tool = server.tools.find(t => t.name === toolName);
       if (tool) {
-        tools.push({ ...tool, serverName });
+        tools.push({ ...tool, serverName, featureSet: serverName });
       }
     }
     // Append virtual tools (no serverName — delegate-internal)
@@ -257,6 +439,10 @@ export class McpHostManager {
     }
     // MCP management tools always available
     tools.push(...MCP_MANAGEMENT_TOOLS);
+    // MCPL proxy tools (only when connected via MCPL)
+    if (this.mcplEnabled) {
+      tools.push(...MCPL_PROXY_TOOLS);
+    }
     return tools;
   }
 
@@ -268,15 +454,87 @@ export class McpHostManager {
   }
 
   /**
+   * §10.6: Get servers that support beforeInference hooks.
+   * Returns { name, client } pairs for forwarding.
+   */
+  getBeforeInferenceServers(): Array<{ name: string; client: Client }> {
+    const result: Array<{ name: string; client: Client }> = [];
+    for (const server of this.servers.values()) {
+      if (server.mcplHooks?.beforeInference) {
+        result.push({ name: server.name, client: server.client });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * §10.5: Get servers that support afterInference hooks.
+   * Returns { name, client, blocking } for forwarding.
+   */
+  getAfterInferenceServers(): Array<{ name: string; client: Client; blocking: boolean }> {
+    const result: Array<{ name: string; client: Client; blocking: boolean }> = [];
+    for (const server of this.servers.values()) {
+      if (server.mcplHooks?.afterInference) {
+        const blocking = typeof server.mcplHooks.afterInference === 'object'
+          ? server.mcplHooks.afterInference.blocking === true
+          : false;
+        result.push({ name: server.name, client: server.client, blocking });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * §6.1: Build featureSets Record from active MCP servers.
+   * Each server name becomes a featureSet key, `uses` lists what the server supports.
+   */
+  buildFeatureSets(): Record<string, import('./mcpl-types.js').McplFeatureSet> {
+    const featureSets: Record<string, import('./mcpl-types.js').McplFeatureSet> = {};
+    for (const server of this.servers.values()) {
+      const caps = server.mcplCaps;
+      const uses: string[] = ['tools']; // every server provides tools
+      // Bug 5: Include all capabilities in uses
+      if (caps?.hooks?.beforeInference) uses.push('contextHooks.beforeInference');
+      if (caps?.hooks?.afterInference) uses.push('contextHooks.afterInference');
+      if (caps?.pushEvents) uses.push('pushEvents');
+      if (caps?.inferenceRequest) uses.push('inferenceRequest');
+      if (caps?.channels?.publish) uses.push('channels.publish');
+      if (caps?.channels?.observe) uses.push('channels.observe');
+      // Fallback: check mcplHooks if mcplCaps not parsed yet
+      if (!caps && server.mcplHooks?.beforeInference) uses.push('contextHooks.beforeInference');
+      if (!caps && server.mcplHooks?.afterInference) uses.push('contextHooks.afterInference');
+
+      const fs: import('./mcpl-types.js').McplFeatureSet = {
+        description: `MCP server: ${server.name}`,
+        uses,
+      };
+      // Bug 1: Forward scoped/rollback from server declarations
+      if (caps?.scoped) fs.scoped = true;
+      if (caps?.rollback) fs.rollback = true;
+      featureSets[server.name] = fs;
+    }
+    return featureSets;
+  }
+
+  /**
    * Call a tool by name, routing to the correct MCP server.
    * Intercepts virtual _scope_elevate tool before MCP server routing.
    */
   async callTool(
     name: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    mcplExtras?: {
+      state?: Record<string, unknown> | null;
+      checkpoint?: string;
+      scope?: { label: string; payload?: Record<string, unknown> };
+    },
   ): Promise<{ content: string; isError: boolean }> {
     // Intercept virtual _scope_elevate tool
-    if (name === '_scope_elevate' && this.scopeElevateHandler) {
+    // L1 fix: explicit error when handler not set (prevents fall-through to "Unknown tool")
+    if (name === '_scope_elevate') {
+      if (!this.scopeElevateHandler) {
+        return { content: 'Scope elevate handler not configured', isError: true };
+      }
       try {
         const result = await this.scopeElevateHandler(args);
         return { content: JSON.stringify(result), isError: false };
@@ -300,6 +558,11 @@ export class McpHostManager {
       return this.handleMcpRestartServer(String(args.serverName || ''));
     }
 
+    // Intercept MCPL proxy virtual tools
+    if (name.startsWith('_mcpl_')) {
+      return this.handleMcplProxy(name, args);
+    }
+
     const serverName = this.toolToServer.get(name);
     if (!serverName) {
       return { content: `Unknown tool: ${name}`, isError: true };
@@ -312,7 +575,14 @@ export class McpHostManager {
 
     try {
       const result = await withTimeout(
-        server.client.callTool({ name, arguments: args }),
+        server.client.callTool({
+          name,
+          arguments: args,
+          // B6: forward MCPL state/checkpoint/scope per spec Section 8.4 / 7.7
+          ...(mcplExtras?.state != null ? { state: mcplExtras.state } : {}),
+          ...(mcplExtras?.checkpoint ? { checkpoint: mcplExtras.checkpoint } : {}),
+          ...(mcplExtras?.scope ? { scope: mcplExtras.scope } : {}),
+        } as any),
         300_000,
         `callTool(${name})`
       );
@@ -466,6 +736,8 @@ export class McpHostManager {
       if (existingServer) {
         await existingServer.client.close();
         this.servers.delete(serverName);
+        // Stale toolToServer fix: rebuild immediately so entries don't point to deleted server
+        this.rebuildToolList();
       }
 
       // Start
@@ -484,6 +756,24 @@ export class McpHostManager {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { content: `Restart server "${serverName}" failed: ${msg}`, isError: true };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // MCPL Proxy handler — forwards _mcpl_* virtual tool calls to backend
+  // ---------------------------------------------------------------------------
+
+  private async handleMcplProxy(name: string, args: Record<string, unknown>): Promise<{ content: string; isError: boolean }> {
+    if (!this.mcplProxyHandler) {
+      return { content: 'MCPL proxy not available (connection is not MCPL)', isError: true };
+    }
+
+    try {
+      const result = await this.mcplProxyHandler(name, args);
+      return { content: JSON.stringify(result), isError: false };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: `MCPL proxy ${name} failed: ${msg}`, isError: true };
     }
   }
 
@@ -534,9 +824,10 @@ export class McpHostManager {
       throw new Error(`Server "${name}" already exists`);
     }
 
+    // F2 fix: Dynamic SSE servers get MCPL capabilities by default
     const client = new Client(
       { name: `animachat-delegate:${name}`, version: '1.0.0' },
-      { capabilities: {} }
+      { capabilities: { experimental: { mcpl: { protocolVersion: '0.4.1-draft' } } } }
     );
 
     const transport = new SSEClientTransport(parsedUrl);
@@ -544,6 +835,8 @@ export class McpHostManager {
 
     // DEL-14: Detect SSE server connection loss (must be after connect())
     client.onclose = () => {
+      // C-2 fix: Don't fire crash notifications during graceful stopAll()
+      if (this.stopping) return;
       if (this.servers.has(name)) {
         console.error(`[McpHost] Dynamic server "${name}" disconnected`);
         this.servers.delete(name);
@@ -555,7 +848,9 @@ export class McpHostManager {
       console.error(`[McpHost] Dynamic server "${name}" error: ${error.message}`);
     };
 
-    const server: McpServer = { name, client, transport, tools: [] };
+    const mcplCaps = this.parseMcplCapabilities(client);
+    const mcplHooks = mcplCaps?.hooks;
+    const server: McpServer = { name, client, transport, tools: [], mcplHooks, mcplCaps };
     await this.collectTools(server);
     this.servers.set(name, server);
     this.rebuildToolList();
@@ -574,18 +869,22 @@ export class McpHostManager {
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args,
-      // BUG-12 fix: process.env values may be undefined. Filter them out instead of
-      // using unsafe `as Record<string, string>` cast which masks the type mismatch.
-      env: config.env
-        ? Object.fromEntries(
-            Object.entries({ ...process.env, ...config.env }).filter((entry): entry is [string, string] => entry[1] !== undefined)
-          )
-        : undefined,
+      // S-5 fix: Only pass safe env vars + explicit config.env to child processes.
+      // Prevents leaking API keys, tokens, database URLs to untrusted MCP servers.
+      // BUG-12 fix: filter out undefined values.
+      env: Object.fromEntries(
+        Object.entries({ ...getSafeEnv(), ...(config.env || {}) })
+          .filter((entry): entry is [string, string] => entry[1] !== undefined)
+      ),
     });
 
+    // F2 fix: Advertise MCPL support via experimental.mcpl if server accepts MCPL context
+    const capabilities = config.acceptsMcplContext
+      ? { experimental: { mcpl: { protocolVersion: '0.4.1-draft' } } }
+      : {};
     const client = new Client(
       { name: `animachat-delegate:${config.name}`, version: '1.0.0' },
-      { capabilities: {} }
+      { capabilities }
     );
 
     await withTimeout(client.connect(transport), 30_000, `connect(stdio:${config.name})`);
@@ -593,6 +892,8 @@ export class McpHostManager {
     // DEL-12: Detect MCP server crash/exit (must be set AFTER connect() which replaces callbacks)
     const serverName = config.name;
     client.onclose = () => {
+      // C-2 fix: Don't fire crash notifications during graceful stopAll()
+      if (this.stopping) return;
       if (this.servers.has(serverName)) {
         console.error(`[McpHost] Server "${serverName}" process exited unexpectedly`);
         this.servers.delete(serverName);
@@ -604,18 +905,76 @@ export class McpHostManager {
       console.error(`[McpHost] Server "${serverName}" error: ${error.message}`);
     };
 
+    // §10: Parse MCPL capabilities from server's initialize result
+    const mcplCaps = this.parseMcplCapabilities(client);
+    const mcplHooks = mcplCaps?.hooks;
+
     const server: McpServer = {
       name: config.name,
       client,
       transport,
       tools: [],
+      mcplHooks,
+      mcplCaps,
     };
 
     // Collect tools from this server
     await this.collectTools(server);
 
     this.servers.set(config.name, server);
-    console.log(`[McpHost] "${config.name}" started with ${server.tools.length} tools`);
+    const hookDesc = mcplHooks ? ` hooks=[${mcplHooks.beforeInference ? 'before' : ''}${mcplHooks.afterInference ? (mcplHooks.beforeInference ? ',' : '') + 'after' : ''}]` : '';
+    console.log(`[McpHost] "${config.name}" started with ${server.tools.length} tools${hookDesc}`);
+  }
+
+  /**
+   * §10: Parse MCPL hook capabilities from server's initializeResult.
+   * Looks in `experimental.mcpl.contextHooks` per spec §5.2.
+   * Returns undefined if server doesn't advertise any hooks.
+   */
+  private parseHookCapabilities(client: Client): McpHookCapabilities | undefined {
+    const mcplCaps = this.parseMcplCapabilities(client);
+    return mcplCaps?.hooks;
+  }
+
+  /** Parse all MCPL capabilities from server's experimental.mcpl declaration */
+  private parseMcplCapabilities(client: Client): McpServerMcplCaps | undefined {
+    const caps = client.getServerCapabilities();
+    if (!caps) return undefined;
+    const experimental = (caps as any).experimental;
+    if (!experimental?.mcpl) return undefined;
+    const mcpl = experimental.mcpl;
+
+    const result: McpServerMcplCaps = {};
+
+    // §10: Context hooks
+    const contextHooks = mcpl.contextHooks;
+    if (contextHooks) {
+      const hooks: McpHookCapabilities = {};
+      if (contextHooks.beforeInference) hooks.beforeInference = true;
+      if (contextHooks.afterInference) {
+        hooks.afterInference = typeof contextHooks.afterInference === 'object'
+          ? { blocking: contextHooks.afterInference.blocking === true }
+          : true;
+      }
+      if (hooks.beforeInference || hooks.afterInference) result.hooks = hooks;
+    }
+
+    // §9: Push events
+    if (mcpl.pushEvents) result.pushEvents = true;
+    // §11: Inference requests
+    if (mcpl.inferenceRequest) result.inferenceRequest = true;
+    // §7.1: Scoped access
+    if (mcpl.scoped) result.scoped = true;
+    // §8.1: Rollback support
+    if (mcpl.rollback) result.rollback = true;
+    // §14: Channels
+    if (mcpl.channels) {
+      result.channels = {};
+      if (mcpl.channels.publish) result.channels.publish = true;
+      if (mcpl.channels.observe) result.channels.observe = true;
+    }
+
+    return Object.keys(result).length > 0 ? result : undefined;
   }
 
   private async collectTools(server: McpServer): Promise<void> {

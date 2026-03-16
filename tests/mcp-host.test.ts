@@ -14,6 +14,8 @@ const mockClose = vi.fn().mockResolvedValue(undefined);
 const mockListTools = vi.fn().mockResolvedValue({ tools: [] });
 const mockCallTool = vi.fn().mockResolvedValue({ content: [], isError: false });
 
+const mockGetServerCapabilities = vi.fn().mockReturnValue(undefined);
+
 vi.mock('@modelcontextprotocol/sdk/client/index.js', () => {
   return {
     Client: class MockClient {
@@ -21,6 +23,7 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => {
       close = mockClose;
       listTools = mockListTools;
       callTool = mockCallTool;
+      getServerCapabilities = mockGetServerCapabilities;
       constructor(_info: unknown, _opts: unknown) {}
     },
   };
@@ -77,6 +80,7 @@ describe('McpHostManager', () => {
     mockConnect.mockResolvedValue(undefined);
     mockClose.mockResolvedValue(undefined);
     mockCallTool.mockResolvedValue({ content: [], isError: false });
+    mockGetServerCapabilities.mockReturnValue(undefined);
   });
 
   // =========================================================================
@@ -421,7 +425,7 @@ describe('McpHostManager', () => {
       });
     });
 
-    it('returns "Unknown tool" when _scope_elevate is called without handler', async () => {
+    it('returns error when _scope_elevate is called without handler', async () => {
       // No handler set on this manager
       const result = await manager.callTool('_scope_elevate', {
         featureSet: 'test',
@@ -430,7 +434,7 @@ describe('McpHostManager', () => {
         capabilities: [],
       });
 
-      expect(result.content).toBe('Unknown tool: _scope_elevate');
+      expect(result.content).toBe('Scope elevate handler not configured');
       expect(result.isError).toBe(true);
     });
 
@@ -498,8 +502,8 @@ describe('McpHostManager', () => {
       const tools = manager.getAllToolsWithServer();
       const elevate = tools.find(t => t.name === '_scope_elevate');
       expect(elevate).toBeDefined();
-      expect(elevate!.description).toContain('capability elevation');
-      expect(elevate!.inputSchema.required).toEqual(['featureSet', 'label', 'reason', 'capabilities']);
+      expect(elevate!.description).toContain('scope elevation');
+      expect(elevate!.inputSchema.required).toEqual(['featureSet', 'label']);
     });
 
     it('does NOT include _scope_elevate tool when no handler is set', async () => {

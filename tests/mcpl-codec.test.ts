@@ -94,17 +94,16 @@ describe('McplCodec (delegate)', () => {
   // ---------------------------------------------------------------------------
 
   describe('encode — Notification', () => {
-    it('encodes mcpl/push_event as JSON-RPC notification (no id)', () => {
+    it('encodes mcpl/featureSets_changed as JSON-RPC notification (no id)', () => {
       const wire = codec.encode({
-        type: 'mcpl/push_event',
-        serverId: 'srv-1',
-        eventType: 'changed',
+        type: 'mcpl/featureSets_changed',
+        added: { 'new-server': { description: 'New', uses: ['tools'] } },
       });
 
       expect(wire.jsonrpc).toBe('2.0');
-      expect(wire.method).toBe('mcpl/push_event');
+      expect(wire.method).toBe('featureSets/changed');
       expect(wire).not.toHaveProperty('id');
-      expect(wire.params).toEqual({ serverId: 'srv-1', eventType: 'changed' });
+      expect(wire.params).toEqual({ added: { 'new-server': { description: 'New', uses: ['tools'] } } });
     });
 
     it('encodes mcpl/connect_server_result as notification (BUG 1 fix)', () => {
@@ -114,7 +113,7 @@ describe('McplCodec (delegate)', () => {
         success: true,
       });
 
-      expect(wire.method).toBe('mcpl/connect_server_result');
+      expect(wire.method).toBe('mcpl/connectServerResult');
       expect(wire).not.toHaveProperty('id');
     });
   });
@@ -132,7 +131,7 @@ describe('McplCodec (delegate)', () => {
 
       expect(wire.jsonrpc).toBe('2.0');
       expect(wire.id).toBe('sg-1');
-      expect(wire.method).toBe('mcpl/state_get');
+      expect(wire.method).toBe('state/get');
     });
 
     it('tracks request in pendingRequests', () => {
@@ -149,7 +148,7 @@ describe('McplCodec (delegate)', () => {
 
       const wire = codec.encode({ type: 'mcpl/scope_change_request', scopes: [] });
 
-      expect(wire.method).toBe('mcpl/scope_change_request');
+      expect(wire.method).toBe('scope/request');
       expect(wire).not.toHaveProperty('id');
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('no requestId'));
 
@@ -222,7 +221,7 @@ describe('McplCodec (delegate)', () => {
       const decoded = codec.decode({
         jsonrpc: '2.0',
         id: 'srv-1',
-        method: 'mcpl/beforeInference',
+        method: 'context/beforeInference',
         params: { conversationId: 'conv-1' },
       });
 
@@ -236,7 +235,7 @@ describe('McplCodec (delegate)', () => {
     it('decodes JSON-RPC notification to internal format', () => {
       const decoded = codec.decode({
         jsonrpc: '2.0',
-        method: 'mcpl/inference_chunk',
+        method: 'inference/chunk',
         params: { chunk: 'data' },
       });
 
